@@ -125,17 +125,32 @@ def simple_router(user_text: str):
         return "qa_numeric", {"k": k, "group": group_col, "metric": metric}
 
     # aggregations: "average marks by subject", "sum revenue by region", "count by subject"
+    # aggregations
     import re
+
+    # case 1: grouped aggregation — “average revenue by region”, “sum marks by subject”, “count by category”
     m = re.search(
-    r"(sum|average|avg|mean|count|min|max|median)\s+(?:of\s+)?([A-Za-z0-9_\-\s]+?)?\s*by\s+([A-Za-z0-9_\-\s]+)",
-    user_text,
-    re.I,
-)
+        r"(sum|average|avg|mean|count|min|max|median)\s+(?:of\s+)?([A-Za-z0-9_\-\s]+?)?\s*by\s+([A-Za-z0-9_\-\s]+)",
+        user_text,
+        re.I,
+    )
     if m:
         agg = m.group(1).lower()
-        metric = (m.group(2) or "").strip()   # may be empty for "count by X"
+        metric = (m.group(2) or "").strip()
         group_col = m.group(3).strip()
         return "agg", {"agg": agg, "metric": metric, "group": group_col}
+
+    # case 2: overall aggregation — “mean of Range_km”, “average Range_km”, “sum revenue”, “count records”
+    m = re.search(
+        r"(sum|average|avg|mean|count|min|max|median)\s+(?:of\s+)?([A-Za-z0-9_\-\s]+)",
+        user_text,
+        re.I,
+    )
+    if m:
+        agg = m.group(1).lower()
+        metric = (m.group(2) or "").strip()
+        return "agg_overall", {"agg": agg, "metric": metric}
+
 
 
     # ranking: "rank students by marks within subject"
@@ -373,6 +388,41 @@ if prompt:
             )
             add_message("assistant", title)
             add_table(df_out, caption="Use ‘top 5 ... by ...’ for ranking, or ‘plot ... by ...’ to visualize.")
+    
+    elif intent == "agg_overall":
+        metric = args.get("metric", "")
+        agg = args.get("agg", "mean")
+        df = st.session_state.df
+        if df is None:
+            add_message("assistant", "❌ No dataset loaded.")
+        else:
+            col = metric
+            # If you added the fuzzy resolver, use it:
+            try:
+                from src.tools.util import resolve_column
+                col = resolve_column(col, df.columns) or col
+            except Exception:
+                pass
+            if col not in df.columns:
+                add_message("assistant", f"❌ Column `{metric}` not found.")
+            else:
+                series = pd.to_numeric(df[col], errors="coerce")
+                agg_norm = {"avg": "mean", "average": "mean"}.get(agg, agg)
+                funcs = {
+                    "mean": series.mean,
+                    "sum": series.sum,
+                    "count": series.count,  # counts non-NaN
+                    "min": series.min,
+                    "max": series.max,
+                    "median": series.median,
+                }
+                func = funcs.get(agg_norm)
+                if not func:
+                    add_message("assistant", f"❌ Unsupported aggregation `{agg}`.")
+                else:
+                    val = func()
+                    add_message("assistant", f"{agg_norm.capitalize()} of `{col}` = **{val:.3f}**")
+
 
     # ---- window-like funcs
     elif intent == "rank_within":
