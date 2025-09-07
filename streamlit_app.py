@@ -111,23 +111,18 @@ def simple_router(user_text: str):
 
     # top-k: "top 5 category by revenue"
     if "top" in s and "by" in s:
-        import re
-        m = re.search(r"top\s+(\d+)\s+(\w+)\s+by\s+(\w+)", s)
+        m = re.search(r"top\s+(\d+)\s+(\w+)\s+by\s+(\w+)", user_text, re.I)
         if m:
-            k = int(m.group(1))
-            group_col = m.group(2)
-            metric = m.group(3)
-            return "qa_numeric", {"k": k, "group": group_col, "metric": metric}
+            return "qa_numeric", {"k": int(m.group(1)), "group": m.group(2).strip(), "metric": m.group(3).strip()}
+
     
         # aggregations: "average marks by subject", "sum revenue by region", "count by subject"
     if " by " in s and any(w in s for w in ["sum", "average", "avg", "mean", "count", "min", "max", "median"]):
         import re
-        m = re.search(r"(sum|average|avg|mean|count|min|max|median)\s+(\w+)?\s*by\s+(\w+)", s)
+        m = re.search(r"(sum|average|avg|mean|count|min|max|median)\s+(\w+)?\s*by\s+(\w+)", user_text, re.I)
         if m:
-            agg = m.group(1)
-            metric = m.group(2) or ""  # metric can be empty for "count by subject"
-            group_col = m.group(3)
-            return "agg", {"agg": agg, "metric": metric, "group": group_col}
+            return "agg", {"agg": m.group(1).lower(), "metric": (m.group(2) or "").strip(), "group": m.group(3).strip()}
+
         
         # ranking: "rank students by marks within subject"
     if "rank" in s and "by" in s and "within" in s:
@@ -222,35 +217,23 @@ def simple_router(user_text: str):
 
 
 
-    # plotting: "plot revenue by month [split by region]"
-    if any(w in s for w in ["plot", "chart", "graph"]):
-        words = s.replace(",", " ").split()
-        y = None
-        x = None
-        hue = None
-        if "plot" in words:
-            try:
-                idx = words.index("plot")
-                y = words[idx + 1]
-            except Exception:
-                pass
-        if "by" in words:
-            try:
-                idx = words.index("by")
-                x = words[idx + 1]
-            except Exception:
-                pass
-        if "split" in words and "by" in words:
-            try:
-                idx = words.index("split")
-                if words[idx + 1] == "by":
-                    hue = words[idx + 2]
-            except Exception:
-                pass
-        # fallbacks to inferred defaults
+    # plots: "plot revenue by month [split by region]"
+    words = user_text.replace(",", " ").split()
+    low = [w.lower() for w in words]
+    y = x = hue = None
+    if "plot" in low:
+        i = low.index("plot")
+        if i+1 < len(words): y = words[i+1]
+    if "by" in low:
+        j = low.index("by")
+        if j+1 < len(words): x = words[j+1]
+    if "split" in low:
+        k = low.index("split")
+        if k+2 < len(words) and low[k+1] == "by": hue = words[k+2]
         y = y or st.session_state.defaults.get("metric")
         x = x or st.session_state.defaults.get("time_col")
         return "plot", {"x": x, "y": y, "hue": hue}
+
 
     # default help
     return "help", {}

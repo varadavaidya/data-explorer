@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+from src.tools.util import resolve_column
+
 
 ARTIFACT_DIR = Path("artifacts/plots")
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -33,11 +35,13 @@ def value_counts(col: str, top: int = 20):
     df = st.session_state.df
     if df is None:
         return None, "No dataset loaded."
-    if col not in df.columns:
+    c = resolve_column(col, df.columns)
+    if c is None:
         return None, f"Column `{col}` not found. Available: {list(df.columns)}"
-    vc = df[col].astype(str).value_counts(dropna=False).head(top).reset_index()
-    vc.columns = [col, "count"]
+    vc = df[c].astype(str).value_counts(dropna=False).head(top).reset_index()
+    vc.columns = [c, "count"]
     return vc, None
+
 
 def correlation_matrix(save_name: str = "corr_matrix"):
     df = st.session_state.df
@@ -66,9 +70,10 @@ def histogram(col: str, bins: int = 30, save_name: str = "hist"):
     df = st.session_state.df
     if df is None:
         return None, "No dataset loaded.", None
-    if col not in df.columns:
+    c = resolve_column(col, df.columns)
+    if c is None:
         return None, f"Column `{col}` not found.", None
-    series = pd.to_numeric(df[col], errors="coerce")
+    series = pd.to_numeric(df[c], errors="coerce")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(series.dropna().values, bins=bins)
@@ -83,18 +88,19 @@ def boxplot(y: str, by: str | None = None, save_name: str = "box"):
     df = st.session_state.df
     if df is None:
         return None, "No dataset loaded.", None
-    if y not in df.columns:
+    yy = resolve_column(y, df.columns)
+    bb = resolve_column(by, df.columns) if by else None
+    if yy is None:
         return None, f"Column `{y}` not found.", None
     fig, ax = plt.subplots(figsize=(7, 4))
-    if by and by in df.columns:
-        groups = [g.dropna().values for _, g in df.groupby(by)[y]]
-        ax.boxplot(groups, labels=[str(k) for k in df.groupby(by).groups.keys()], vert=True)
-        ax.set_xlabel(by)
+    if bb:
+        groups = [g.dropna().values for _, g in df.groupby(bb)[yy]]
+        ax.boxplot(groups, labels=[str(k) for k in df.groupby(bb).groups.keys()], vert=True)
+        ax.set_xlabel(bb)
     else:
-        ax.boxplot(pd.to_numeric(df[y], errors="coerce").dropna().values, vert=True)
-    ax.set_ylabel(y)
-    fig.tight_layout()
-    out = ARTIFACT_DIR / f"{save_name}_{y}{'_'+by if by else ''}.png"
+        ax.boxplot(pd.to_numeric(df[yy], errors="coerce").dropna().values, vert=True)
+    ax.set_ylabel(yy)
+    out = ARTIFACT_DIR / f"{save_name}_{yy}{'_'+bb if bb else ''}.png"
     fig.savefig(out)
     plt.close(fig)
     # return small summary table (median, q1, q3)
@@ -104,18 +110,17 @@ def pivot_table(index: str, columns: str, values: str, agg: str = "sum"):
     df = st.session_state.df
     if df is None:
         return None, "No dataset loaded."
-    for c in [index, columns, values]:
-        if c not in df.columns:
-            return None, f"Column `{c}` not found."
-    # coerce values numeric if possible
-    vals = pd.to_numeric(df[values].astype(str).str.replace(r"[^\d\.\-]", "", regex=True), errors="coerce")
-    tmp = df.copy()
-    tmp[values] = vals
-    agg_map = {"sum":"sum", "mean":"mean", "avg":"mean", "average":"mean", "min":"min", "max":"max", "median":"median", "count":"count"}
+    idx = resolve_column(index, df.columns)
+    cols = resolve_column(columns, df.columns)
+    vals = resolve_column(values, df.columns)
+    for name, c in [("index", idx), ("columns", cols), ("values", vals)]:
+        if c is None:
+            return None, f"Column `{locals()[name]}` not found."
+    vseries = pd.to_numeric(df[vals].astype(str).str.replace(r"[^\d\.\-]", "", regex=True), errors="coerce")
+    tmp = df.copy(); tmp[vals] = vseries
+    agg_map = {"sum":"sum","mean":"mean","avg":"mean","average":"mean","min":"min","max":"max","median":"median","count":"count"}
     a = agg_map.get(agg.lower(), "sum")
-    pt = pd.pivot_table(tmp, index=index, columns=columns, values=values,
-                        aggfunc=(len if a=="count" else a), fill_value=0).reset_index()
-    # flatten columns if multi-index
+    pt = pd.pivot_table(tmp, index=idx, columns=cols, values=vals, aggfunc=(len if a=="count" else a), fill_value=0).reset_index()
     if isinstance(pt.columns, pd.MultiIndex):
         pt.columns = ["_".join([str(c) for c in tup if c!=""]) for tup in pt.columns.values]
     return pt, None
@@ -124,9 +129,10 @@ def outliers_zscore(col: str, threshold: float = 3.0):
     df = st.session_state.df
     if df is None:
         return None, "No dataset loaded."
-    if col not in df.columns:
+    c = resolve_column(col, df.columns)
+    if c is None:
         return None, f"Column `{col}` not found."
-    series = pd.to_numeric(df[col], errors="coerce")
+    series = pd.to_numeric(df[c], errors="coerce")
     mu, sigma = series.mean(), series.std(ddof=0)
     if np.isnan(mu) or np.isnan(sigma) or sigma == 0:
         return None, "Cannot compute z-scores for this column."
