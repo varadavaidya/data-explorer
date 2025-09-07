@@ -402,7 +402,7 @@ if prompt:
         if err: add_message("assistant", f"❌ {err}")
         else: add_table(df_out, caption=f"Lagged {args['metric']} by {args['shift']}")
     
-        elif intent == "describe":
+    elif intent == "describe":
         df_out, err = describe_numeric()
         add_message("assistant", "Summary statistics (numeric columns):" if not err else f"❌ {err}")
         if not err: add_table(df_out)
@@ -456,10 +456,6 @@ if prompt:
                 add_message("assistant", "No outliers found.")
             else:
                 add_table(df_out)
-
-    
-
-
 
     else:
         default_metric = st.session_state.defaults.get("metric") or "<metric>"
