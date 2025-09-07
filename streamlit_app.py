@@ -9,6 +9,12 @@ import streamlit as st
 
 from src.tools.analytics import list_columns, top_k_by_group, aggregate_by_group
 from src.tools.viz import plot_group_sum 
+from src.tools.windows_funcs import rank_within, cumulative_sum, rolling_mean, lag_lead
+from src.tools.more_funcs import (
+    describe_numeric, missing_report, value_counts, correlation_matrix,
+    histogram, boxplot, pivot_table, outliers_zscore
+)
+
 # --- DB init & session id
 from src.db import init_db, db
 
@@ -122,6 +128,98 @@ def simple_router(user_text: str):
             metric = m.group(2) or ""  # metric can be empty for "count by subject"
             group_col = m.group(3)
             return "agg", {"agg": agg, "metric": metric, "group": group_col}
+        
+        # ranking: "rank students by marks within subject"
+    if "rank" in s and "by" in s and "within" in s:
+        words = s.split()
+        try:
+            idx_by = words.index("by")
+            idx_within = words.index("within")
+            order_col = words[idx_by+1]
+            group_col = words[idx_within+1]
+            return "rank_within", {"group": group_col, "order": order_col}
+        except Exception:
+            pass
+
+    # cumulative sum: "cumulative sum of revenue by month"
+    if "cumulative sum" in s:
+        import re
+        m = re.search(r"cumulative sum of (\w+) by (\w+)", s)
+        if m:
+            metric, group_col = m.group(1), m.group(2)
+            return "cumsum", {"group": group_col, "metric": metric}
+
+    # rolling mean: "rolling 3 month average of sales"
+    if "rolling" in s and "average" in s:
+        import re
+        m = re.search(r"rolling\s+(\d+)\s+\w+\s+average of (\w+)", s)
+        if m:
+            window, metric = int(m.group(1)), m.group(2)
+            # assume time_col is already in defaults
+            return "rolling_mean", {"time_col": st.session_state.defaults.get("time_col"), "metric": metric, "window": window}
+
+    # lag: "lag marks by 1"
+    if s.startswith("lag"):
+        import re
+        m = re.search(r"lag (\w+) by (\d+)", s)
+        if m:
+            metric, shift = m.group(1), int(m.group(2))
+            return "lag", {"time_col": st.session_state.defaults.get("time_col"), "metric": metric, "shift": shift}
+    
+        # describe / summary
+    if "describe" in s or "summary" in s:
+        return "describe", {}
+
+    # missing values report
+    if "missing" in s and ("values" in s or "report" in s):
+        return "missing", {}
+
+    # value counts: "value counts of subject" or "top 10 values for subject"
+    if "value counts" in s or ("top" in s and "values" in s):
+        import re
+        m = re.search(r"(?:value counts of|value counts for|top\s+(\d+)\s+values\s+for)\s+(\w+)", s)
+        if m:
+            top = int(m.group(1)) if m.group(1) else 20
+            col = m.group(2)
+            return "value_counts", {"col": col, "top": top}
+
+    # correlation matrix
+    if "correlation matrix" in s or "correlation" in s:
+        return "corr", {}
+
+    # histogram: "histogram of marks [bins 20]"
+    if "histogram" in s:
+        import re
+        m = re.search(r"histogram of (\w+)(?:.*bins\s+(\d+))?", s)
+        if m:
+            col = m.group(1); bins = int(m.group(2)) if m.group(2) else 30
+            return "hist", {"col": col, "bins": bins}
+
+    # boxplot: "boxplot marks [by subject]"
+    if "boxplot" in s:
+        import re
+        m = re.search(r"boxplot\s+(\w+)(?:\s+by\s+(\w+))?", s)
+        if m:
+            y = m.group(1); by = m.group(2)
+            return "box", {"y": y, "by": by}
+
+    # pivot table: "pivot values revenue by region and month [agg mean]"
+    if s.startswith("pivot") or "pivot table" in s:
+        import re
+        m = re.search(r"pivot (?:values\s+)?(\w+)\s+by\s+(\w+)\s+and\s+(\w+)(?:.*agg\s+(\w+))?", s)
+        if m:
+            values, index, columns, agg = m.group(1), m.group(2), m.group(3), (m.group(4) or "sum")
+            return "pivot", {"index": index, "columns": columns, "values": values, "agg": agg}
+
+    # outliers: "outliers in marks [z 3]"
+    if "outlier" in s:
+        import re
+        m = re.search(r"outliers in (\w+)(?:.*z\s+([\d\.]+))?", s)
+        if m:
+            col = m.group(1); thr = float(m.group(2)) if m.group(2) else 3.0
+            return "outliers", {"col": col, "z": thr}
+
+
 
 
     # plotting: "plot revenue by month [split by region]"
@@ -282,6 +380,86 @@ if prompt:
                 spec = {"x": x, "y": y, "hue": hue, "agg": "sum"}
                 add_message("assistant", f"Saved chart to `{path}`.")
                 add_image(path, caption=path, spec=spec)
+    
+
+    elif intent == "rank_within":
+        df_out, err = rank_within(args["group"], args["order"])
+        if err: add_message("assistant", f"❌ {err}")
+        else: add_table(df_out, caption=f"Rank of {args['order']} within {args['group']}")
+
+    elif intent == "cumsum":
+        df_out, err = cumulative_sum(args["group"], args["metric"])
+        if err: add_message("assistant", f"❌ {err}")
+        else: add_table(df_out, caption=f"Cumulative sum of {args['metric']} by {args['group']}")
+
+    elif intent == "rolling_mean":
+        df_out, err = rolling_mean(args["time_col"], args["metric"], args["window"])
+        if err: add_message("assistant", f"❌ {err}")
+        else: add_table(df_out, caption=f"Rolling {args['window']}-period mean of {args['metric']}")
+
+    elif intent == "lag":
+        df_out, err = lag_lead(args["time_col"], args["metric"], args["shift"])
+        if err: add_message("assistant", f"❌ {err}")
+        else: add_table(df_out, caption=f"Lagged {args['metric']} by {args['shift']}")
+    
+        elif intent == "describe":
+        df_out, err = describe_numeric()
+        add_message("assistant", "Summary statistics (numeric columns):" if not err else f"❌ {err}")
+        if not err: add_table(df_out)
+
+    elif intent == "missing":
+        df_out, err = missing_report()
+        add_message("assistant", "Missing values report:" if not err else f"❌ {err}")
+        if not err: add_table(df_out)
+
+    elif intent == "value_counts":
+        df_out, err = value_counts(args["col"], top=args.get("top", 20))
+        add_message("assistant", f"Value counts for `{args['col']}`:" if not err else f"❌ {err}")
+        if not err: add_table(df_out)
+
+    elif intent == "corr":
+        df_out, path, err = correlation_matrix()
+        if err: add_message("assistant", f"❌ {err}")
+        else:
+            add_message("assistant", "Correlation matrix (numeric columns):")
+            add_table(df_out, caption="Heatmap saved below.")
+            add_image(path, caption=path, spec={"type": "corr"})
+
+    elif intent == "hist":
+        df_out, err, path = histogram(args["col"], bins=args.get("bins", 30))
+        if err: add_message("assistant", f"❌ {err}")
+        else:
+            add_message("assistant", f"Histogram of `{args['col']}`:")
+            add_image(path, caption=path, spec={"type": "hist", "col": args["col"], "bins": args.get("bins", 30)})
+
+    elif intent == "box":
+        df_out, err, path = boxplot(args["y"], by=args.get("by"))
+        if err: add_message("assistant", f"❌ {err}")
+        else:
+            title = f"Boxplot of {args['y']}" + (f" by {args['by']}" if args.get("by") else "")
+            add_message("assistant", title)
+            add_image(path, caption=path, spec={"type": "box", "y": args["y"], "by": args.get("by")})
+
+    elif intent == "pivot":
+        df_out, err = pivot_table(args["index"], args["columns"], args["values"], agg=args.get("agg", "sum"))
+        add_message("assistant", f"Pivot: {args['index']} × {args['columns']} → {args['values']} ({args.get('agg','sum')})"
+                     if not err else f"❌ {err}")
+        if not err: add_table(df_out)
+
+    elif intent == "outliers":
+        df_out, err = outliers_zscore(args["col"], threshold=args.get("z", 3.0))
+        if err:
+            add_message("assistant", f"❌ {err}")
+        else:
+            add_message("assistant", f"Outliers in `{args['col']}` (|z| ≥ {args.get('z',3.0)}):")
+            if df_out.empty:
+                add_message("assistant", "No outliers found.")
+            else:
+                add_table(df_out)
+
+    
+
+
 
     else:
         default_metric = st.session_state.defaults.get("metric") or "<metric>"
@@ -296,5 +474,6 @@ if prompt:
                 f"‘plot {default_metric} by {default_time}, split by region’\n"
             ),
         )
+    
 
     render_messages()
