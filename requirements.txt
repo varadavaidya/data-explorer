@@ -1,0 +1,16 @@
+# Core dependencies
+streamlit>=1.36.0     # web app UI
+pandas>=2.2.2         # data analysis
+numpy>=1.26.4         # numerical ops (used under the hood by pandas)
+matplotlib>=3.8.0     # plotting
+
+# Backend + persistence
+sqlite-utils>=3.36.0  # optional helpers for SQLite (we use sqlite3 stdlib too)
+
+# Agent / orchestration (for later milestones)
+langgraph>=0.2.0
+langchain-core>=0.3.0
+pydantic>=2.7.0       # data validation
+
+# Config / env management
+python-dotenv>=1.0.1
