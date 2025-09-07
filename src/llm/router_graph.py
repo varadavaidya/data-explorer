@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional, Literal, Dict, Any, Tuple
 from pydantic import BaseModel, Field, ValidationError
 from langgraph.graph import StateGraph, END
-from langchain_ollama import ChatOllama
+from langchain_community.chat_models import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 import pandas as pd
 import streamlit as st
