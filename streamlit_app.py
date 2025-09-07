@@ -66,7 +66,7 @@ def add_image(path: str, caption: str | None = None, spec: dict | None = None):
 
 
 def render_messages():
-    for m in st.session_state.messages:
+    for i, m in enumerate(st.session_state.messages):
         with st.chat_message(m["role"]):
             mtype = m.get("type", "text")
             if mtype == "text":
@@ -76,8 +76,18 @@ def render_messages():
                 st.dataframe(_df, use_container_width=True)
                 if m.get("caption"):
                     st.caption(m["caption"])
+                # Download CSV button
+                csv_bytes = _df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download CSV",
+                    data=csv_bytes,
+                    file_name=f"table_{i}.csv",
+                    mime="text/csv",
+                    key=f"dl-{i}",
+                )
             elif mtype == "image":
                 st.image(m["path"], caption=m.get("caption"))
+
 
 
 # =========================
@@ -111,6 +121,47 @@ def top_k_by_group(k: int, group_col: str, metric: str):
 
     grouped = tmp.groupby(group_col)[metric].sum(min_count=1).sort_values(ascending=False).head(k)
     return grouped.reset_index(), None
+
+
+def aggregate_by_group(group_col: str, metric: str, agg: str = "sum"):
+    """Return a 2-col dataframe grouped by `group_col` with the chosen aggregation over `metric`."""
+    df = st.session_state.df
+    if df is None:
+        return None, "No dataset loaded."
+    if group_col not in df.columns:
+        return None, f"Column `{group_col}` not found. Available: {list(df.columns)}"
+    if agg.lower() not in {"count"} and metric not in df.columns:
+        nums = list(df.select_dtypes(include="number").columns)
+        return None, f"Metric column `{metric}` not found. Try one of: {nums}"
+
+    tmp = df.copy()
+
+    if agg.lower() == "count":
+        # count rows per group (ignores `metric`)
+        out = tmp.groupby(group_col).size().reset_index(name="count").sort_values("count", ascending=False)
+        return out, None
+
+    # robust numeric coercion for metric (₹1,200 → 1200)
+    mseries = pd.to_numeric(
+        tmp[metric].astype(str).str.replace(r"[^\d\.\-]", "", regex=True),
+        errors="coerce",
+    )
+    tmp[metric] = mseries
+
+    agg_map = {
+        "sum": "sum",
+        "mean": "mean",
+        "avg": "mean",
+        "average": "mean",
+        "min": "min",
+        "max": "max",
+        "median": "median",
+    }
+    a = agg_map.get(agg.lower(), "sum")
+    grouped = getattr(tmp.groupby(group_col)[metric], a)().reset_index()
+    grouped = grouped.sort_values(grouped.columns[-1], ascending=False)
+    return grouped, None
+
 
 
 def plot_group_sum(x_col: str, y_col: str, hue: str | None = None, fname_prefix: str = "chart"):
@@ -156,6 +207,17 @@ def simple_router(user_text: str):
             group_col = m.group(2)
             metric = m.group(3)
             return "qa_numeric", {"k": k, "group": group_col, "metric": metric}
+    
+        # aggregations: "average marks by subject", "sum revenue by region", "count by subject"
+    if " by " in s and any(w in s for w in ["sum", "average", "avg", "mean", "count", "min", "max", "median"]):
+        import re
+        m = re.search(r"(sum|average|avg|mean|count|min|max|median)\s+(\w+)?\s*by\s+(\w+)", s)
+        if m:
+            agg = m.group(1)
+            metric = m.group(2) or ""  # metric can be empty for "count by subject"
+            group_col = m.group(3)
+            return "agg", {"agg": agg, "metric": metric, "group": group_col}
+
 
     # plotting: "plot revenue by month [split by region]"
     if any(w in s for w in ["plot", "chart", "graph"]):
@@ -286,6 +348,20 @@ if prompt:
                 df_out,
                 caption="Tip: say ‘plot them by <time_col>’ or ‘plot marks by subject, split by name’.",
             )
+    
+    elif intent == "agg":
+        agg = args.get("agg", "sum")
+        metric = args.get("metric", "")
+        group = args.get("group")
+        df_out, err = aggregate_by_group(group, metric, agg=agg)
+        if err:
+            add_message("assistant", f"❌ {err}")
+        else:
+            pretty_agg = {"avg":"average"}.get(agg, agg)
+            title = f"{pretty_agg.capitalize()} {metric} by {group}" if agg != "count" else f"Count by {group}"
+            add_message("assistant", title)
+            add_table(df_out, caption="Use ‘top 5 ... by ...’ for ranking, or ‘plot ... by ...’ to visualize.")
+
 
     elif intent == "plot":
         x = args.get("x")
