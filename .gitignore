@@ -1,0 +1,31 @@
+# Python venv & caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Streamlit & local config
+.streamlit/
+.env
+
+# Artifacts generated at runtime (plots, db, logs)
+artifacts/
+!artifacts/plots/
+artifacts/plots/*.png
+artifacts/app.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Notebooks
+*.ipynb_checkpoints/
+
+# Test/coverage (if added later)
+.pytest_cache/
+.coverage*
+htmlcov/
