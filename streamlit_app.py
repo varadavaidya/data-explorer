@@ -45,13 +45,42 @@ else:
     st.sidebar.info("Upload a CSV to get started.")
 
 # --- Helpers (why): keep UI clean and reusable)
+# --- Helpers (persist messages + attachments across reruns)
 def add_message(role: str, content: str):
-    st.session_state.messages.append({"role": role, "content": content})
+    st.session_state.messages.append({"role": role, "type": "text", "content": content})
+
+def add_table(df, caption: str | None = None):
+    st.session_state.messages.append({
+        "role": "assistant",
+        "type": "table",
+        "columns": list(df.columns),
+        "data": df.to_dict(orient="records"),
+        "caption": caption,
+    })
+
+def add_image(path: str, caption: str | None = None):
+    st.session_state.messages.append({
+        "role": "assistant",
+        "type": "image",
+        "path": path,
+        "caption": caption,
+    })
 
 def render_messages():
     for m in st.session_state.messages:
         with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+            mtype = m.get("type", "text")
+            if mtype == "text":
+                st.markdown(m["content"])
+            elif mtype == "table":
+                import pandas as _pd
+                _df = _pd.DataFrame(m["data"], columns=m["columns"])
+                st.dataframe(_df, use_container_width=True)
+                if m.get("caption"):
+                    st.caption(m["caption"])
+            elif mtype == "image":
+                st.image(m["path"], caption=m.get("caption"))
+
 
 def list_columns():
     if st.session_state.df is None:
@@ -69,8 +98,16 @@ def top_k_by_group(k: int, group_col: str, metric: str):
     if metric not in df.columns:
         nums = list(df.select_dtypes(include="number").columns)
         return None, f"Metric column `{metric}` not found. Try one of: {nums}"
-    grouped = df.groupby(group_col)[metric].sum().sort_values(ascending=False).head(k)
+    # Try to coerce metric to numeric (handles strings like "1,200" or "₹1,200")
+    mseries = pd.to_numeric(
+        df[metric].astype(str).str.replace(r"[^\d\.\-]", "", regex=True),
+        errors="coerce"
+    )
+    tmp = df.copy()
+    tmp[metric] = mseries
+    grouped = tmp.groupby(group_col)[metric].sum(min_count=1).sort_values(ascending=False).head(k)
     return grouped.reset_index(), None
+
 
 def plot_group_sum(x_col: str, y_col: str, hue: str | None = None, fname_prefix: str = "chart"):
     df = st.session_state.df
@@ -162,10 +199,11 @@ if prompt:
             add_message("assistant", f"❌ {err}")
         else:
             add_message("assistant", f"Here are the top {args.get('k', 5)} {args.get('group')} by {args.get('metric')}:")
-            with st.chat_message("assistant"):
-                st.dataframe(df_out, use_container_width=True)
-                st.caption("Tip: Say ‘plot them by month’ or ‘plot revenue by month, split by region’.")
-            # remember last table if you want (future)
+            add_table(
+                df_out,
+                caption="Tip: Say ‘plot them by <time_col>’ or ‘plot marks by subject, split by name’."
+        )
+
 
     elif intent == "plot":
         x = args.get("x"); y = args.get("y"); hue = args.get("hue")
@@ -177,6 +215,7 @@ if prompt:
                 add_message("assistant", f"❌ {err}")
             else:
                 add_message("assistant", f"Saved chart to `{path}`.")
+                add_image(path, caption=path)
                 with st.chat_message("assistant"):
                     st.image(path, caption=path)
 
