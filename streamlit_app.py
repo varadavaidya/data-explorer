@@ -125,12 +125,18 @@ def simple_router(user_text: str):
         return "qa_numeric", {"k": k, "group": group_col, "metric": metric}
 
     # aggregations: "average marks by subject", "sum revenue by region", "count by subject"
-    m = re.search(r"(sum|average|avg|mean|count|min|max|median)\s+(\w+)?\s*by\s+(\w+)", user_text, re.I)
+    import re
+    m = re.search(
+    r"(sum|average|avg|mean|count|min|max|median)\s+(?:of\s+)?([A-Za-z0-9_\-\s]+?)?\s*by\s+([A-Za-z0-9_\-\s]+)",
+    user_text,
+    re.I,
+)
     if m:
         agg = m.group(1).lower()
-        metric = (m.group(2) or "").strip()   # metric may be empty for "count by X"
+        metric = (m.group(2) or "").strip()   # may be empty for "count by X"
         group_col = m.group(3).strip()
         return "agg", {"agg": agg, "metric": metric, "group": group_col}
+
 
     # ranking: "rank students by marks within subject"
     if "rank" in s and "by" in s and "within" in s:
@@ -205,25 +211,25 @@ def simple_router(user_text: str):
         return "outliers", {"col": col, "z": thr}
 
     # plots: "plot revenue by month [split by region]"
+    # plots: "plot revenue by month [split by region]"
     words = user_text.replace(",", " ").split()
     low = [w.lower() for w in words]
-    y = x = hue = None
     if "plot" in low:
+        y = x = hue = None
         i = low.index("plot")
         if i + 1 < len(words):
-            y = words[i + 1]
-    if "by" in low:
-        j = low.index("by")
-        if j + 1 < len(words):
-            x = words[j + 1]
-    if "split" in low:
-        k = low.index("split")
-        if k + 2 < len(words) and low[k + 1] == "by":
-            hue = words[k + 2]
-    # fallbacks to inferred defaults
-    y = y or st.session_state.defaults.get("metric")
-    x = x or st.session_state.defaults.get("time_col")
-    if y or x:
+            y = words[i + 1]  # metric
+        if "by" in low:
+            j = low.index("by")
+            if j + 1 < len(words):
+                x = words[j + 1]  # x axis
+        if "split" in low:
+            k = low.index("split")
+            if k + 2 < len(words) and low[k + 1] == "by":
+                hue = words[k + 2]  # series
+        # fallback only when user asked to plot
+        y = y or st.session_state.defaults.get("metric")
+        x = x or st.session_state.defaults.get("time_col")
         return "plot", {"x": x, "y": y, "hue": hue}
 
     # default help
@@ -231,37 +237,37 @@ def simple_router(user_text: str):
 
 
 # ------------------------------------------------------------------
-# Sidebar: dataset & danger zone
+# Sidebar: dataset (upload) + schema + danger zone
 # ------------------------------------------------------------------
 st.sidebar.header("Dataset")
 
-# Example datasets
-examples = {
-    "— select —": None,
-    "Sales (revenue)": "examples/sales.csv",
-    "Students (marks)": "examples/students.csv",
-}
-choice = st.sidebar.selectbox("Load example dataset", list(examples.keys()))
-if choice and examples[choice]:
-    df = pd.read_csv(examples[choice])
-    st.session_state.df = df
-    st.session_state.schema = {c: str(df[c].dtype) for c in df.columns}
-    # infer defaults
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    time_candidates = [c for c in df.columns if any(k in c.lower() for k in ["date", "time", "month", "year"])]
-    st.session_state.defaults["metric"] = (st.session_state.defaults.get("metric") or (num_cols[0] if num_cols else None))
-    st.session_state.defaults["time_col"] = (st.session_state.defaults.get("time_col") or (time_candidates[0] if time_candidates else None))
-
-# Or upload your own CSV
-uploaded = st.sidebar.file_uploader("...or upload a CSV", type=["csv"])
+# Upload a CSV (no examples)
+uploaded = st.sidebar.file_uploader("Upload a CSV file", type=["csv"])
 if uploaded is not None:
     df = pd.read_csv(uploaded)
     st.session_state.df = df
     st.session_state.schema = {c: str(df[c].dtype) for c in df.columns}
+
+    # Infer sensible defaults
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     time_candidates = [c for c in df.columns if any(k in c.lower() for k in ["date", "time", "month", "year"])]
-    st.session_state.defaults["metric"] = (st.session_state.defaults.get("metric") or (num_cols[0] if num_cols else None))
-    st.session_state.defaults["time_col"] = (st.session_state.defaults.get("time_col") or (time_candidates[0] if time_candidates else None))
+    st.session_state.defaults["metric"] = st.session_state.defaults.get("metric") or (num_cols[0] if num_cols else None)
+    st.session_state.defaults["time_col"] = st.session_state.defaults.get("time_col") or (
+        time_candidates[0] if time_candidates else None
+    )
+
+# Schema preview (always visible if a DF is loaded)
+with st.sidebar.expander("📑 Schema", expanded=True):
+    if st.session_state.df is None:
+        st.info("Upload a CSV to see columns and types.")
+    else:
+        cols = list(st.session_state.df.columns)
+        dtypes = [str(st.session_state.df[c].dtype) for c in cols]
+        schema_df = pd.DataFrame({"column": cols, "dtype": dtypes})
+        st.dataframe(schema_df, use_container_width=True, hide_index=True)
+        # Optional: quick sample
+        if st.checkbox("Show first 10 rows", key="show_head"):
+            st.dataframe(st.session_state.df.head(10), use_container_width=True)
 
 # Danger Zone: resets
 with st.sidebar.expander("⚠️ Danger zone", expanded=False):
@@ -285,7 +291,7 @@ with st.sidebar.expander("⚠️ Danger zone", expanded=False):
         st.success("Current session cleared.")
         st.experimental_rerun()
 
-    confirm = st.checkbox("I understand this will delete ALL sessions")
+    confirm = st.checkbox("I understand this will delete ALL sessions", key="wipe_all_confirm")
     if st.button("Wipe entire database") and confirm:
         try:
             for img in Path("artifacts/plots").glob("*.png"):
@@ -307,7 +313,7 @@ with st.sidebar.expander("⚠️ Danger zone", expanded=False):
 # ------------------------------------------------------------------
 st.title("💬 Data Explorer")
 st.caption(
-    "Upload a CSV (or pick an example) and ask things like: "
+    "Upload a CSV and ask things like: "
     "• ‘what columns do i have’ • ‘top 5 category by revenue’ • "
     "‘average marks by subject’ • ‘correlation matrix’ • "
     "‘histogram of marks bins 20’ • ‘boxplot marks by subject’ • "
