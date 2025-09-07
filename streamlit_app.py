@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from src.llm.router_graph import run_router_graph
 
 # --- DB init & session id
 from src.db import init_db, db
@@ -327,6 +328,7 @@ with st.sidebar.expander("⚠️ Danger zone", expanded=False):
 # Main UI
 # ------------------------------------------------------------------
 st.title("💬 Data Explorer")
+use_creative = st.toggle("✨ Creative mode (LLM routing + narration)", value=False)
 st.caption(
     "Upload a CSV and ask things like: "
     "• ‘what columns do i have’ • ‘top 5 category by revenue’ • "
@@ -355,177 +357,197 @@ if prompt:
     # record the user message
     add_message("user", prompt)
 
-    # route to an intent (rules today; LLM later)
-    intent, args = simple_router(prompt)
-
-    # ---- schema probe
-    if intent == "schema_probe":
-        add_message("assistant", list_columns())
-
-    # ---- top-k numeric
-    elif intent == "qa_numeric":
-        df_out, err = top_k_by_group(args.get("k", 5), args.get("group"), args.get("metric"))
+    if use_creative:
+        result, narrative, err = run_router_graph(prompt)
         if err:
             add_message("assistant", f"❌ {err}")
         else:
-            add_message("assistant", f"Here are the top {args.get('k', 5)} {args.get('group')} by {args.get('metric')}:")
-            add_table(
-                df_out,
-                caption="Tip: say ‘plot them by <time_col>’ or ‘plot marks by subject, split by name’.",
-            )
+            # render by kind
+            kind = result["kind"]
+            if kind == "text":
+                add_message("assistant", result["payload"])
+            elif kind == "table":
+                add_table(result["payload"])
+            elif kind == "table+image":
+                add_table(result["payload"]["table"])
+                add_image(result["payload"]["path"], caption=result["payload"]["path"])
+            elif kind == "image":
+                add_image(result["payload"]["path"], caption=result["payload"]["caption"])
+            # add the creative, short narrative
+            if narrative:
+                add_message("assistant", narrative)
+    else:
+        # route to an intent (rules today; LLM later)
+        intent, args = simple_router(prompt)
 
-    # ---- general aggregations (sum/average/count/min/max/median)
-    elif intent == "agg":
-        df_out, err = aggregate_by_group(args.get("group"), args.get("metric", ""), agg=args.get("agg", "sum"))
-        if err:
-            add_message("assistant", f"❌ {err}")
-        else:
-            pretty_agg = {"avg": "average"}.get(args.get("agg", "sum"), args.get("agg", "sum"))
-            title = (
-                f"{pretty_agg.capitalize()} {args.get('metric')} by {args.get('group')}"
-                if args.get("agg") != "count"
-                else f"Count by {args.get('group')}"
-            )
-            add_message("assistant", title)
-            add_table(df_out, caption="Use ‘top 5 ... by ...’ for ranking, or ‘plot ... by ...’ to visualize.")
-    
-    elif intent == "agg_overall":
-        metric = args.get("metric", "")
-        agg = args.get("agg", "mean")
-        df = st.session_state.df
-        if df is None:
-            add_message("assistant", "❌ No dataset loaded.")
-        else:
-            col = metric
-            # If you added the fuzzy resolver, use it:
-            try:
-                from src.tools.util import resolve_column
-                col = resolve_column(col, df.columns) or col
-            except Exception:
-                pass
-            if col not in df.columns:
-                add_message("assistant", f"❌ Column `{metric}` not found.")
-            else:
-                series = pd.to_numeric(df[col], errors="coerce")
-                agg_norm = {"avg": "mean", "average": "mean"}.get(agg, agg)
-                funcs = {
-                    "mean": series.mean,
-                    "sum": series.sum,
-                    "count": series.count,  # counts non-NaN
-                    "min": series.min,
-                    "max": series.max,
-                    "median": series.median,
-                }
-                func = funcs.get(agg_norm)
-                if not func:
-                    add_message("assistant", f"❌ Unsupported aggregation `{agg}`.")
-                else:
-                    val = func()
-                    add_message("assistant", f"{agg_norm.capitalize()} of `{col}` = **{val:.3f}**")
+        # ---- schema probe
+        if intent == "schema_probe":
+            add_message("assistant", list_columns())
 
-
-    # ---- window-like funcs
-    elif intent == "rank_within":
-        df_out, err = rank_within(args["group"], args["order"])
-        add_message("assistant", f"Rank of {args['order']} within {args['group']}" if not err else f"❌ {err}")
-        if not err:
-            add_table(df_out)
-
-    elif intent == "cumsum":
-        df_out, err = cumulative_sum(args["group"], args["metric"])
-        add_message("assistant", f"Cumulative sum of {args['metric']} by {args['group']}" if not err else f"❌ {err}")
-        if not err:
-            add_table(df_out)
-
-    elif intent == "rolling_mean":
-        df_out, err = rolling_mean(args["time_col"], args["metric"], args.get("window", 3))
-        add_message("assistant", f"Rolling {args.get('window',3)}-period mean of {args['metric']}" if not err else f"❌ {err}")
-        if not err:
-            add_table(df_out)
-
-    elif intent == "lag":
-        df_out, err = lag_lead(args["time_col"], args["metric"], args.get("shift", 1))
-        add_message("assistant", f"Lagged {args['metric']} by {args.get('shift',1)}" if not err else f"❌ {err}")
-        if not err:
-            add_table(df_out)
-
-    # ---- extra analysis tools
-    elif intent == "describe":
-        df_out, err = describe_numeric()
-        add_message("assistant", "Summary statistics (numeric columns):" if not err else f"❌ {err}")
-        if not err:
-            add_table(df_out)
-
-    elif intent == "missing":
-        df_out, err = missing_report()
-        add_message("assistant", "Missing values report:" if not err else f"❌ {err}")
-        if not err:
-            add_table(df_out)
-
-    elif intent == "value_counts":
-        df_out, err = value_counts(args["col"], top=args.get("top", 20))
-        add_message("assistant", f"Value counts for `{args['col']}`:" if not err else f"❌ {err}")
-        if not err:
-            add_table(df_out)
-
-    elif intent == "corr":
-        df_out, path, err = correlation_matrix()
-        if err:
-            add_message("assistant", f"❌ {err}")
-        else:
-            add_message("assistant", "Correlation matrix (numeric columns):")
-            add_table(df_out, caption="Heatmap saved below.")
-            add_image(path, caption=path, spec={"type": "corr"})
-
-    elif intent == "hist":
-        df_out, err, path = histogram(args["col"], bins=args.get("bins", 30))
-        if err:
-            add_message("assistant", f"❌ {err}")
-        else:
-            add_message("assistant", f"Histogram of `{args['col']}`:")
-            add_image(path, caption=path, spec={"type": "hist", "col": args["col"], "bins": args.get("bins", 30)})
-
-    elif intent == "box":
-        df_out, err, path = boxplot(args["y"], by=args.get("by"))
-        if err:
-            add_message("assistant", f"❌ {err}")
-        else:
-            title = f"Boxplot of {args['y']}" + (f" by {args.get('by')}" if args.get("by") else "")
-            add_message("assistant", title)
-            add_image(path, caption=path, spec={"type": "box", "y": args["y"], "by": args.get("by")})
-
-    elif intent == "pivot":
-        df_out, err = pivot_table(args["index"], args["columns"], args["values"], agg=args.get("agg", "sum"))
-        add_message(
-            "assistant",
-            f"Pivot: {args['index']} × {args['columns']} → {args['values']} ({args.get('agg','sum')})"
-            if not err
-            else f"❌ {err}",
-        )
-        if not err:
-            add_table(df_out)
-
-    # ---- plotting (bar / grouped bar)
-    elif intent == "plot":
-        x = args.get("x")
-        y = args.get("y")
-        hue = args.get("hue")
-        if not y:
-            add_message("assistant", "I couldn't infer the metric to plot. Try: ‘plot revenue by month’.")
-        else:
-            path, err = plot_group_sum(x, y, hue=hue, fname_prefix="user")
+        # ---- top-k numeric
+        elif intent == "qa_numeric":
+            df_out, err = top_k_by_group(args.get("k", 5), args.get("group"), args.get("metric"))
             if err:
                 add_message("assistant", f"❌ {err}")
             else:
-                spec = {"x": x, "y": y, "hue": hue, "agg": "sum"}
-                add_message("assistant", f"Saved chart to `{path}`.")
-                add_image(path, caption=path, spec=spec)
+                add_message("assistant", f"Here are the top {args.get('k', 5)} {args.get('group')} by {args.get('metric')}:")
+                add_table(
+                    df_out,
+                    caption="Tip: say ‘plot them by <time_col>’ or ‘plot marks by subject, split by name’.",
+                )
 
-    # ---- default help
-    else:
-        default_metric = st.session_state.defaults.get("metric") or "<metric>"
-        default_time = st.session_state.defaults.get("time_col") or "<time_col>"
-        add_message(
+        # ---- general aggregations (sum/average/count/min/max/median)
+        elif intent == "agg":
+            df_out, err = aggregate_by_group(args.get("group"), args.get("metric", ""), agg=args.get("agg", "sum"))
+            if err:
+                add_message("assistant", f"❌ {err}")
+            else:
+                pretty_agg = {"avg": "average"}.get(args.get("agg", "sum"), args.get("agg", "sum"))
+                title = (
+                    f"{pretty_agg.capitalize()} {args.get('metric')} by {args.get('group')}"
+                    if args.get("agg") != "count"
+                    else f"Count by {args.get('group')}"
+                )
+                add_message("assistant", title)
+                add_table(df_out, caption="Use ‘top 5 ... by ...’ for ranking, or ‘plot ... by ...’ to visualize.")
+    
+        elif intent == "agg_overall":
+            metric = args.get("metric", "")
+            agg = args.get("agg", "mean")
+            df = st.session_state.df
+            if df is None:
+                add_message("assistant", "❌ No dataset loaded.")
+            else:
+                col = metric
+                # If you added the fuzzy resolver, use it:
+                try:
+                    from src.tools.util import resolve_column
+                    col = resolve_column(col, df.columns) or col
+                except Exception:
+                    pass
+                if col not in df.columns:
+                    add_message("assistant", f"❌ Column `{metric}` not found.")
+                else:
+                    series = pd.to_numeric(df[col], errors="coerce")
+                    agg_norm = {"avg": "mean", "average": "mean"}.get(agg, agg)
+                    funcs = {
+                        "mean": series.mean,
+                        "sum": series.sum,
+                        "count": series.count,  # counts non-NaN
+                        "min": series.min,
+                        "max": series.max,
+                        "median": series.median,
+                    }
+                    func = funcs.get(agg_norm)
+                    if not func:
+                        add_message("assistant", f"❌ Unsupported aggregation `{agg}`.")
+                    else:
+                        val = func()
+                        add_message("assistant", f"{agg_norm.capitalize()} of `{col}` = **{val:.3f}**")
+
+
+        # ---- window-like funcs
+        elif intent == "rank_within":
+            df_out, err = rank_within(args["group"], args["order"])
+            add_message("assistant", f"Rank of {args['order']} within {args['group']}" if not err else f"❌ {err}")
+            if not err:
+                add_table(df_out)
+
+        elif intent == "cumsum":
+            df_out, err = cumulative_sum(args["group"], args["metric"])
+            add_message("assistant", f"Cumulative sum of {args['metric']} by {args['group']}" if not err else f"❌ {err}")
+            if not err:
+                add_table(df_out)
+
+        elif intent == "rolling_mean":
+            df_out, err = rolling_mean(args["time_col"], args["metric"], args.get("window", 3))
+            add_message("assistant", f"Rolling {args.get('window',3)}-period mean of {args['metric']}" if not err else f"❌ {err}")
+            if not err:
+                add_table(df_out)
+
+        elif intent == "lag":
+            df_out, err = lag_lead(args["time_col"], args["metric"], args.get("shift", 1))
+            add_message("assistant", f"Lagged {args['metric']} by {args.get('shift',1)}" if not err else f"❌ {err}")
+            if not err:
+                add_table(df_out)
+
+        # ---- extra analysis tools
+        elif intent == "describe":
+            df_out, err = describe_numeric()
+            add_message("assistant", "Summary statistics (numeric columns):" if not err else f"❌ {err}")
+            if not err:
+                add_table(df_out)
+
+        elif intent == "missing":
+            df_out, err = missing_report()
+            add_message("assistant", "Missing values report:" if not err else f"❌ {err}")
+            if not err:
+                add_table(df_out)
+
+        elif intent == "value_counts":
+            df_out, err = value_counts(args["col"], top=args.get("top", 20))
+            add_message("assistant", f"Value counts for `{args['col']}`:" if not err else f"❌ {err}")
+            if not err:
+                add_table(df_out)
+
+        elif intent == "corr":
+            df_out, path, err = correlation_matrix()
+            if err:
+                add_message("assistant", f"❌ {err}")
+            else:
+                add_message("assistant", "Correlation matrix (numeric columns):")
+                add_table(df_out, caption="Heatmap saved below.")
+                add_image(path, caption=path, spec={"type": "corr"})
+
+        elif intent == "hist":
+            df_out, err, path = histogram(args["col"], bins=args.get("bins", 30))
+            if err:
+                add_message("assistant", f"❌ {err}")
+            else:
+                add_message("assistant", f"Histogram of `{args['col']}`:")
+                add_image(path, caption=path, spec={"type": "hist", "col": args["col"], "bins": args.get("bins", 30)})
+
+        elif intent == "box":
+            df_out, err, path = boxplot(args["y"], by=args.get("by"))
+            if err:
+                add_message("assistant", f"❌ {err}")
+            else:
+                title = f"Boxplot of {args['y']}" + (f" by {args.get('by')}" if args.get("by") else "")
+                add_message("assistant", title)
+                add_image(path, caption=path, spec={"type": "box", "y": args["y"], "by": args.get("by")})
+
+        elif intent == "pivot":
+            df_out, err = pivot_table(args["index"], args["columns"], args["values"], agg=args.get("agg", "sum"))
+            add_message(
+                "assistant",
+                f"Pivot: {args['index']} × {args['columns']} → {args['values']} ({args.get('agg','sum')})"
+                if not err
+                else f"❌ {err}",
+            )
+            if not err:
+                add_table(df_out)
+
+        # ---- plotting (bar / grouped bar)
+        elif intent == "plot":
+            x = args.get("x")
+            y = args.get("y")
+            hue = args.get("hue")
+            if not y:
+                add_message("assistant", "I couldn't infer the metric to plot. Try: ‘plot revenue by month’.")
+            else:
+                path, err = plot_group_sum(x, y, hue=hue, fname_prefix="user")
+                if err:
+                    add_message("assistant", f"❌ {err}")
+                else:
+                    spec = {"x": x, "y": y, "hue": hue, "agg": "sum"}
+                    add_message("assistant", f"Saved chart to `{path}`.")
+                    add_image(path, caption=path, spec=spec)
+
+        # ---- default help
+        else:
+            default_metric = st.session_state.defaults.get("metric") or "<metric>"
+            default_time = st.session_state.defaults.get("time_col") or "<time_col>"
+            add_message(
             "assistant",
             (
                 "Try these:\n"
@@ -537,7 +559,7 @@ if prompt:
                 f"- **Visualize** → ‘plot {default_metric} by {default_time}’, ‘histogram of {default_metric} bins 20’, ‘boxplot {default_metric} by category’\n"
                 "- **Pivot** → ‘pivot values revenue by region and month agg mean’\n"
             ),
-        )
+            )
 
-# Re-render history (single call → no duplicate keys)
-render_messages()
+    # Re-render history (single call → no duplicate keys)
+    render_messages()

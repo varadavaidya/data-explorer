@@ -57,6 +57,29 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
+---
+
+### 5. (Optional) Creative Mode with LLM
+
+Data Explorer supports an optional **Creative Mode**, powered by [Ollama](https://ollama.com/), that lets you phrase queries naturally:
+
+- "minimum of Year"
+- "most common vehicle types"
+- "plot average range over time"
+- "compare resale value by region"
+
+Behind the scenes:
+- A local LLM (Llama 3, Mistral, etc.) interprets your request.
+- The app validates the JSON intent.
+- The same safe Pandas/Matplotlib/SQLite tools execute the result.
+
+### 6. To use Creative Mode:
+1. Make sure [Ollama](https://ollama.com/download) is running.
+2. Confirm you’ve pulled a model (e.g.):
+   ```bash
+   ollama pull llama3
+
+
 ### 📂 Project Structure
 
 ```

@@ -7,10 +7,15 @@ matplotlib>=3.8.0     # plotting
 # Backend + persistence
 sqlite-utils>=3.36.0  # optional helpers for SQLite (we use sqlite3 stdlib too)
 
-# Agent / orchestration (for later milestones)
+# Agent / orchestration
 langgraph>=0.2.0
 langchain-core>=0.3.0
-pydantic>=2.7.0       # data validation
+langchain-community>=0.3.0   # extra integrations
+langchain-ollama>=0.1.0      # Ollama wrapper for LangChain
+pydantic>=2.7.0              # data validation
 
 # Config / env management
 python-dotenv>=1.0.1
+
+# Networking
+requests>=2.31.0
