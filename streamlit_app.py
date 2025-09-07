@@ -326,10 +326,27 @@ with st.sidebar.expander("⚠️ Danger zone", expanded=False):
 # =========================
 st.title("💬 Data Explorer")
 st.caption(
-    "Upload a CSV in the sidebar, then ask things like "
-    "‘what columns do i have’, ‘top 5 category by revenue’, "
-    "or ‘plot marks by subject, split by name’."
+    "Upload a CSV (or pick an example) and ask things like: "
+    "• ‘what columns do i have’ • ‘top 5 category by revenue’ • "
+    "‘average marks by subject’ • ‘correlation matrix’ • "
+    "‘histogram of marks bins 20’ • ‘boxplot marks by subject’ • "
+    "‘pivot values revenue by region and month agg mean’ • "
+    "‘rank students by marks within subject’ • "
+    "‘cumulative sum of revenue by month’ • ‘lag marks by 1’ • "
+    "‘plot revenue by month, split by region’"
 )
+
+with st.expander("📒 Cheat sheet (what can I ask?)", expanded=False):
+    st.markdown("""
+- **Schema**: `what columns do i have`
+- **Top-k**: `top 5 category by revenue`
+- **Aggregations**: `average marks by subject`, `sum revenue by region`, `count by subject`
+- **Window-like**: `rank students by marks within subject`, `cumulative sum of revenue by month`, `rolling 3 month average of sales`, `lag marks by 1`
+- **Exploration**: `missing values report`, `value counts of subject`, `correlation matrix`
+- **Visuals**: `plot revenue by month, split by region`, `histogram of marks bins 20`, `boxplot marks by subject`
+- **Pivot**: `pivot values revenue by region and month agg mean`
+""")
+
 
 render_messages()
 
@@ -463,13 +480,17 @@ if prompt:
         add_message(
             "assistant",
             (
-                "Try these:\n"
-                "- **Columns?** → ‘what columns do i have?’\n"
-                f"- **Top-k** → ‘top 5 category by {default_metric}’\n"
-                f"- **Plot** → ‘plot {default_metric} by {default_time}’ or "
-                f"‘plot {default_metric} by {default_time}, split by region’\n"
+            "Try these:\n"
+            "- **Schema** → ‘what columns do i have?’\n"
+            f"- **Top-k** → ‘top 5 category by {default_metric}’\n"
+            f"- **Aggregate** → ‘average {default_metric} by category’, ‘count by subject’\n"
+            "- **Window** → ‘rank students by marks within subject’, ‘cumulative sum of revenue by month’\n"
+            "- **Explore** → ‘missing values report’, ‘value counts of subject’, ‘correlation matrix’\n"
+            f"- **Visualize** → ‘plot {default_metric} by {default_time}’, ‘histogram of {default_metric} bins 20’, ‘boxplot {default_metric} by category’\n"
+            "- **Pivot** → ‘pivot values revenue by region and month agg mean’\n"
             ),
         )
+
     
 
     render_messages()
