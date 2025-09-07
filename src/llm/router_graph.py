@@ -4,6 +4,7 @@ from typing import Optional, Literal, Dict, Any, Tuple
 from pydantic import BaseModel, Field, ValidationError
 from langgraph.graph import StateGraph, END
 from langchain_community.chat_models import ChatOllama
+import os
 from langchain_core.messages import SystemMessage, HumanMessage
 import pandas as pd
 import streamlit as st
@@ -58,8 +59,10 @@ class S(BaseModel):
     narrative: Optional[str] = None
 
 # --------- LLMs ---------
-router_llm = ChatOllama(model="llama3.1:8b-instruct", temperature=0.2)
-narrator_llm = ChatOllama(model="llama3.1:8b-instruct", temperature=0.7)
+MODEL = os.getenv("OLLAMA_MODEL", "llama3")  # change default if you pulled a different tag
+router_llm = ChatOllama(model=MODEL, temperature=0.2)
+narrator_llm = ChatOllama(model=MODEL, temperature=0.7)
+
 
 SYSTEM_ROUTE = (
     "You are a routing assistant. Return ONE JSON object only, no prose. "
@@ -87,10 +90,17 @@ def node_route(state: S) -> S:
         SystemMessage(SYSTEM_ROUTE),
         HumanMessage(_route_prompt(state.query, cols)),
     ]
-    out = router_llm.invoke(msgs).content.strip()
+    try:
+        out = router_llm.invoke(msgs).content.strip()
+    except Exception as e:
+        # Graceful failure (don’t crash the app)
+        state.error = f"LLM router unavailable: {e}"
+        return state
+
     # strip possible code fences
     if out.startswith("```"):
         out = out.strip("`").replace("json", "", 1).strip()
+
     import json
     try:
         data = json.loads(out)
