@@ -1,565 +1,462 @@
-# streamlit_app.py — Data Explorer (Streamlit)
+# streamlit_app.py — RELIABLE DROP-IN
 from __future__ import annotations
-import uuid
+import os, sys, uuid
 from pathlib import Path
+from typing import Optional, Dict, Any
 
 import pandas as pd
 import streamlit as st
 from src.llm.router_graph import run_router_graph
 
-# --- DB init & session id
-from src.db import init_db, db
+# ------------------------------------------------------------------
+# Make sure we can import from ./src even if not a package
+# ------------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+# --- Imports: router(s), tools, db
+try:
+    from src.router import simple_router
+except Exception:
+    # Minimal fallback router if import fails
+    def simple_router(txt: str):
+        low = (txt or "").lower().strip()
+        if low in {"what columns do i have", "columns", "schema", "list columns"}:
+            return "schema_probe", {}
+        if low.startswith("mean ") or "mean of" in low or "average" in low:
+            # naive overall mean: "mean of X"
+            parts = low.split()
+            col = parts[-1] if parts else ""
+            return "agg_overall", {"agg": "mean", "metric": col}
+        return "help", {}
 
-# Tools (logic lives in src/tools/*)
-from src.tools.analytics import list_columns, top_k_by_group, aggregate_by_group
-from src.tools.viz import plot_group_sum
-from src.tools.windows_funcs import rank_within, cumulative_sum, rolling_mean, lag_lead
-from src.tools.more_funcs import (
-    describe_numeric, missing_report, value_counts, correlation_matrix,
-    histogram, boxplot, pivot_table, outliers_zscore
-)
+from src.tools.util import resolve_column
+import src.tools.analytics as analytics
+import src.tools.more_funcs as more
+import src.tools.viz as viz
+import src.tools.windows_funcs as win
+import src.db as db
+
+# Creative router (optional)
+try:
+    from src.llm.router_graph import run_router_graph
+    HAVE_LLM = True
+except Exception:
+    HAVE_LLM = False
 
 # ------------------------------------------------------------------
-# App bootstrap
+# Paths
 # ------------------------------------------------------------------
-st.set_page_config(page_title="Data Explorer", layout="wide")
-init_db()  # ensure artifacts/app.db & tables exist
-
-# session id per browser tab
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
-db.ensure_session(st.session_state.session_id, title="Streamlit Session")
-
-# --- Session state defaults (kept in memory during tab lifetime)
-if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of dicts: {"role","type",...}
-if "df" not in st.session_state:
-    st.session_state.df = None
-if "schema" not in st.session_state:
-    st.session_state.schema = {}
-if "defaults" not in st.session_state:
-    st.session_state.defaults = {"metric": None, "time_col": None}
-
-# Load persisted chat history once per browser tab refresh
-if "loaded_from_db" not in st.session_state:
-    st.session_state.messages = db.load_messages(st.session_state.session_id)
-    st.session_state.loaded_from_db = True
+ART_DIR = Path("artifacts")
+PLOTS_DIR = ART_DIR / "plots"
+ART_DIR.mkdir(exist_ok=True)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ------------------------------------------------------------------
-# Helpers: artifacts, messages, render
+# Session bootstrap
 # ------------------------------------------------------------------
-ARTIFACT_DIR = Path("artifacts/plots")
-ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+def _init_state():
+    st.session_state.setdefault("session_id", str(uuid.uuid4()))
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("df", None)
+    st.session_state.setdefault("schema", {})
+    st.session_state.setdefault("defaults", {"metric": None, "time_col": None})
+    st.session_state.setdefault("use_creative", False)
+    st.session_state.setdefault("last_router_status", None)
+    st.session_state.setdefault("last_uploaded", None)
+    try:
+        db.ensure_session(st.session_state.session_id, title="Streamlit Session")
+    except Exception:
+        pass
 
+_init_state()
 
-def add_message(role: str, content: str):
-    st.session_state.messages.append({"role": role, "type": "text", "content": content})
-    db.add_text(st.session_state.session_id, role, content)
+# ------------------------------------------------------------------
+# Chat helpers
+# ------------------------------------------------------------------
+def _uid(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
+def add_message(role: str, text: str):
+    st.session_state.messages.append({"role": role, "type": "text", "text": text})
+    try:
+        db.add_message(st.session_state.session_id, role, text)
+    except Exception:
+        pass
 
-def add_table(df: pd.DataFrame, caption: str | None = None):
-    msg = {
-        "role": "assistant",
-        "type": "table",
-        "columns": list(df.columns),
-        "data": df.to_dict(orient="records"),
-        "caption": caption,
-        "uid": str(uuid.uuid4()),  # unique id for download button keys
-    }
-    st.session_state.messages.append(msg)
-    db.add_table(
-        st.session_state.session_id,
-        msg["columns"],
-        msg["data"],
-        caption=caption,
-    )
+def add_table(df: pd.DataFrame, tag: str = "TABLE"):
+    uid = _uid("tbl")
+    st.session_state.messages.append({"role": "assistant", "type": "table", "df": df, "tag": tag, "uid": uid})
+    try:
+        db.add_table(st.session_state.session_id, df, tag=tag)
+    except Exception:
+        pass
 
-
-def add_image(path: str, caption: str | None = None, spec: dict | None = None):
-    st.session_state.messages.append({"role": "assistant", "type": "image", "path": path, "caption": caption})
-    db.add_image(st.session_state.session_id, path, caption=caption)
-    db.add_plot(st.session_state.session_id, path, spec or {})
-
+def add_image(path: str, caption: Optional[str] = None, spec: Optional[Dict[str, Any]] = None):
+    uid = _uid("img")
+    st.session_state.messages.append({"role": "assistant", "type": "image", "path": path, "caption": caption, "uid": uid})
+    try:
+        db.add_image(st.session_state.session_id, path, caption=caption, spec=spec or {})
+    except Exception:
+        pass
 
 def render_messages():
-    for i, m in enumerate(st.session_state.messages):
-        with st.chat_message(m["role"]):
-            mtype = m.get("type", "text")
-            if mtype == "text":
-                st.markdown(m.get("content", ""))
-            elif mtype == "table":
-                _df = pd.DataFrame(m["data"], columns=m["columns"])
-                st.dataframe(_df, use_container_width=True)
-                if m.get("caption"):
-                    st.caption(m["caption"])
-                # Download CSV button (unique key)
-                csv_bytes = _df.to_csv(index=False).encode("utf-8")
-                dl_key = f"dl-{m.get('uid') or f'{i}-{st.session_state.session_id}'}"
+    for m in st.session_state.messages:
+        if m["type"] == "text":
+            with st.chat_message("user" if m["role"] == "user" else "assistant"):
+                st.write(m["text"])
+        elif m["type"] == "table":
+            with st.chat_message("assistant"):
+                if m.get("tag"):
+                    st.caption(f"🧮 {m['tag']}")
+                st.dataframe(m["df"], use_container_width=True)
                 st.download_button(
                     "Download CSV",
-                    data=csv_bytes,
-                    file_name=f"table_{i}.csv",
+                    m["df"].to_csv(index=False).encode("utf-8"),
+                    file_name=f"{m['uid']}.csv",
                     mime="text/csv",
-                    key=dl_key,
+                    key=f"dl-{m['uid']}",
                 )
-            elif mtype == "image":
-                st.image(m["path"], caption=m.get("caption"))
-
-
-# ------------------------------------------------------------------
-# Router (rules today; LLM later). IMPORTANT: preserve original casing.
-# ------------------------------------------------------------------
-def simple_router(user_text: str):
-    s = user_text.lower().strip()
-
-    # schema questions
-    if "column" in s and ("what" in s or "show" in s or "schema" in s):
-        return "schema_probe", {}
-
-    # top-k: "top 5 category by revenue"
-    import re
-    m = re.search(r"top\s+(\d+)\s+(\w+)\s+by\s+(\w+)", user_text, re.I)
-    if m:
-        k = int(m.group(1))
-        group_col = m.group(2).strip()
-        metric = m.group(3).strip()
-        return "qa_numeric", {"k": k, "group": group_col, "metric": metric}
-
-    # aggregations: "average marks by subject", "sum revenue by region", "count by subject"
-    # aggregations
-    import re
-
-    # case 1: grouped aggregation — “average revenue by region”, “sum marks by subject”, “count by category”
-    m = re.search(
-        r"(sum|average|avg|mean|count|min|max|median)\s+(?:of\s+)?([A-Za-z0-9_\-\s]+?)?\s*by\s+([A-Za-z0-9_\-\s]+)",
-        user_text,
-        re.I,
-    )
-    if m:
-        agg = m.group(1).lower()
-        metric = (m.group(2) or "").strip()
-        group_col = m.group(3).strip()
-        return "agg", {"agg": agg, "metric": metric, "group": group_col}
-
-    # case 2: overall aggregation — “mean of Range_km”, “average Range_km”, “sum revenue”, “count records”
-    m = re.search(
-        r"(sum|average|avg|mean|count|min|max|median)\s+(?:of\s+)?([A-Za-z0-9_\-\s]+)",
-        user_text,
-        re.I,
-    )
-    if m:
-        agg = m.group(1).lower()
-        metric = (m.group(2) or "").strip()
-        return "agg_overall", {"agg": agg, "metric": metric}
-
-
-
-    # ranking: "rank students by marks within subject"
-    if "rank" in s and "by" in s and "within" in s:
-        words = user_text.split()
-        try:
-            idx_by = [w.lower() for w in words].index("by")
-            idx_within = [w.lower() for w in words].index("within")
-            order_col = words[idx_by + 1]
-            group_col = words[idx_within + 1]
-            return "rank_within", {"group": group_col, "order": order_col}
-        except Exception:
-            pass
-
-    # cumulative sum: "cumulative sum of revenue by month"
-    m = re.search(r"cumulative\s+sum\s+of\s+(\w+)\s+by\s+(\w+)", user_text, re.I)
-    if m:
-        metric, group_col = m.group(1), m.group(2)
-        return "cumsum", {"group": group_col, "metric": metric}
-
-    # rolling mean: "rolling 3 month average of sales"
-    m = re.search(r"rolling\s+(\d+)\s+\w+\s+average\s+of\s+(\w+)", user_text, re.I)
-    if m:
-        window, metric = int(m.group(1)), m.group(2)
-        return "rolling_mean", {
-            "time_col": st.session_state.defaults.get("time_col"),
-            "metric": metric,
-            "window": window,
-        }
-
-    # lag: "lag marks by 1"
-    m = re.search(r"lag\s+(\w+)\s+by\s+(\d+)", user_text, re.I)
-    if m:
-        metric, shift = m.group(1), int(m.group(2))
-        return "lag", {"time_col": st.session_state.defaults.get("time_col"), "metric": metric, "shift": shift}
-
-    # value counts: "value counts of subject" or "top 10 values for subject"
-    m = re.search(r"(?:value\s+counts\s+(?:of|for)|top\s+(\d+)\s+values\s+for)\s+(\w+)", user_text, re.I)
-    if m:
-        top = int(m.group(1)) if m.group(1) else 20
-        col = m.group(2)
-        return "value_counts", {"col": col, "top": top}
-
-    # correlation matrix
-    if "correlation" in s:
-        return "corr", {}
-
-    # histogram: "histogram of marks [bins 20]"
-    m = re.search(r"histogram\s+of\s+(\w+)(?:.*bins\s+(\d+))?", user_text, re.I)
-    if m:
-        col = m.group(1)
-        bins = int(m.group(2)) if m.group(2) else 30
-        return "hist", {"col": col, "bins": bins}
-
-    # boxplot: "boxplot marks [by subject]"
-    m = re.search(r"boxplot\s+(\w+)(?:\s+by\s+(\w+))?", user_text, re.I)
-    if m:
-        y = m.group(1)
-        by = m.group(2)
-        return "box", {"y": y, "by": by}
-
-    # pivot table: "pivot values revenue by region and month [agg mean]"
-    m = re.search(r"pivot\s+(?:values\s+)?(\w+)\s+by\s+(\w+)\s+and\s+(\w+)(?:.*agg\s+(\w+))?", user_text, re.I)
-    if m:
-        values, index, columns, agg = m.group(1), m.group(2), m.group(3), (m.group(4) or "sum")
-        return "pivot", {"index": index, "columns": columns, "values": values, "agg": agg}
-
-    # outliers: "outliers in marks [z 3]"
-    m = re.search(r"outliers\s+in\s+(\w+)(?:.*z\s+([\d\.]+))?", user_text, re.I)
-    if m:
-        col = m.group(1)
-        thr = float(m.group(2)) if m.group(2) else 3.0
-        return "outliers", {"col": col, "z": thr}
-
-    # plots: "plot revenue by month [split by region]"
-    # plots: "plot revenue by month [split by region]"
-    words = user_text.replace(",", " ").split()
-    low = [w.lower() for w in words]
-    if "plot" in low:
-        y = x = hue = None
-        i = low.index("plot")
-        if i + 1 < len(words):
-            y = words[i + 1]  # metric
-        if "by" in low:
-            j = low.index("by")
-            if j + 1 < len(words):
-                x = words[j + 1]  # x axis
-        if "split" in low:
-            k = low.index("split")
-            if k + 2 < len(words) and low[k + 1] == "by":
-                hue = words[k + 2]  # series
-        # fallback only when user asked to plot
-        y = y or st.session_state.defaults.get("metric")
-        x = x or st.session_state.defaults.get("time_col")
-        return "plot", {"x": x, "y": y, "hue": hue}
-
-    # default help
-    return "help", {}
-
+        elif m["type"] == "image":
+            with st.chat_message("assistant"):
+                st.image(m["path"], caption=m.get("caption") or m["path"], use_container_width=True)
 
 # ------------------------------------------------------------------
-# Sidebar: dataset (upload) + schema + danger zone
+# Page
 # ------------------------------------------------------------------
-st.sidebar.header("Dataset")
-
-# Upload a CSV (no examples)
-uploaded = st.sidebar.file_uploader("Upload a CSV file", type=["csv"])
-if uploaded is not None:
-    df = pd.read_csv(uploaded)
-    st.session_state.df = df
-    st.session_state.schema = {c: str(df[c].dtype) for c in df.columns}
-
-    # Infer sensible defaults
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    time_candidates = [c for c in df.columns if any(k in c.lower() for k in ["date", "time", "month", "year"])]
-    st.session_state.defaults["metric"] = st.session_state.defaults.get("metric") or (num_cols[0] if num_cols else None)
-    st.session_state.defaults["time_col"] = st.session_state.defaults.get("time_col") or (
-        time_candidates[0] if time_candidates else None
-    )
-
-# Schema preview (always visible if a DF is loaded)
-with st.sidebar.expander("📑 Schema", expanded=True):
-    if st.session_state.df is None:
-        st.info("Upload a CSV to see columns and types.")
-    else:
-        cols = list(st.session_state.df.columns)
-        dtypes = [str(st.session_state.df[c].dtype) for c in cols]
-        schema_df = pd.DataFrame({"column": cols, "dtype": dtypes})
-        st.dataframe(schema_df, use_container_width=True, hide_index=True)
-        # Optional: quick sample
-        if st.checkbox("Show first 10 rows", key="show_head"):
-            st.dataframe(st.session_state.df.head(10), use_container_width=True)
-
-# Danger Zone: resets
-with st.sidebar.expander("⚠️ Danger zone", expanded=False):
-    st.caption("These actions permanently delete data.")
-    if st.button("Clear current session (chat + DB)"):
-        # remove this session's plot files
-        try:
-            for p in db.get_plot_paths(st.session_state.session_id):
-                Path(p).unlink(missing_ok=True)
-        except Exception as e:
-            st.toast(f"Note: Could not remove some plot files: {e}")
-        # clear DB rows for this session
-        db.clear_session(st.session_state.session_id)
-        # reset Streamlit state with a fresh session id
-        st.session_state.messages = []
-        st.session_state.df = None
-        st.session_state.schema = {}
-        st.session_state.defaults = {"metric": None, "time_col": None}
-        st.session_state.session_id = str(uuid.uuid4())
-        db.ensure_session(st.session_state.session_id, title="Streamlit Session")
-        st.success("Current session cleared.")
-        st.experimental_rerun()
-
-    confirm = st.checkbox("I understand this will delete ALL sessions", key="wipe_all_confirm")
-    if st.button("Wipe entire database") and confirm:
-        try:
-            for img in Path("artifacts/plots").glob("*.png"):
-                img.unlink(missing_ok=True)
-        except Exception as e:
-            st.toast(f"Note: Could not remove some plot files: {e}")
-        db.wipe_all()
-        st.session_state.messages = []
-        st.session_state.df = None
-        st.session_state.schema = {}
-        st.session_state.defaults = {"metric": None, "time_col": None}
-        st.session_state.session_id = str(uuid.uuid4())
-        db.ensure_session(st.session_state.session_id, title="Streamlit Session")
-        st.success("Entire database wiped.")
-        st.experimental_rerun()
-
-# ------------------------------------------------------------------
-# Main UI
-# ------------------------------------------------------------------
-st.title("💬 Data Explorer")
-use_creative = st.toggle("✨ Creative mode (LLM routing + narration)", value=False)
+st.set_page_config(page_title="📊 Data Explorer", page_icon="📊", layout="wide")
+st.title("📊 Data Explorer")
 st.caption(
     "Upload a CSV and ask things like: "
-    "• ‘what columns do i have’ • ‘top 5 category by revenue’ • "
-    "‘average marks by subject’ • ‘correlation matrix’ • "
+    "• ‘what columns do i have’ • ‘top 5 Vehicle_Type’ • "
+    "‘average Range_km by Region’ • ‘mean of Year’ • "
     "‘histogram of marks bins 20’ • ‘boxplot marks by subject’ • "
     "‘pivot values revenue by region and month agg mean’ • "
     "‘rank students by marks within subject’ • "
     "‘cumulative sum of revenue by month’ • ‘lag marks by 1’ • "
-    "‘plot revenue by month, split by region’"
+    "‘plot average Range_km by Year, split by Region’"
 )
 
-with st.expander("📒 Cheat sheet (what can I ask?)", expanded=False):
-    st.markdown("""
-- **Schema**: `what columns do i have`
-- **Top-k**: `top 5 category by revenue`
-- **Aggregations**: `average marks by subject`, `sum revenue by region`, `count by subject`
-- **Window-like**: `rank students by marks within subject`, `cumulative sum of revenue by month`, `rolling 3 month average of sales`, `lag marks by 1`
-- **Exploration**: `missing values report`, `value counts of subject`, `correlation matrix`
-- **Visuals**: `plot revenue by month, split by region`, `histogram of marks bins 20`, `boxplot marks by subject`
-- **Pivot**: `pivot values revenue by region and month agg mean`
-""")
+# ------------------------------------------------------------------
+# Sidebar: upload + schema + creative toggle + danger + debug
+# ------------------------------------------------------------------
+st.sidebar.header("Dataset")
 
+uploaded = st.sidebar.file_uploader("Upload a CSV file", type=["csv"])
+if uploaded is not None and st.session_state.get("last_uploaded") != uploaded.name:
+    df = pd.read_csv(uploaded)
+    st.session_state.df = df
+    st.session_state.schema = {c: str(df[c].dtype) for c in df.columns}
+
+    # infer defaults
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    time_candidates = [c for c in df.columns if any(k in c.lower() for k in ["date", "time", "month", "year"])]
+    st.session_state.defaults["metric"] = st.session_state.defaults.get("metric") or (num_cols[0] if num_cols else None)
+    st.session_state.defaults["time_col"] = st.session_state.defaults.get("time_col") or (time_candidates[0] if time_candidates else None)
+
+    add_message("assistant", f"📥 Loaded **{uploaded.name}** with {len(df)} rows and {len(df.columns)} columns.")
+    st.session_state["last_uploaded"] = uploaded.name
+
+# Schema
+with st.sidebar.expander("📑 Schema", expanded=True):
+    if st.session_state.df is None:
+        st.info("Upload a CSV to see columns and types.")
+    else:
+        df = st.session_state.df
+        schema_df = pd.DataFrame({"column": df.columns, "dtype": [str(df[c].dtype) for c in df.columns]})
+        st.dataframe(schema_df, use_container_width=True, hide_index=True)
+        if st.checkbox("Show first 10 rows", key="show_head"):
+            st.dataframe(df.head(10), use_container_width=True)
+
+# Creative toggle
+label = "✨ Creative Mode (LLM routing + narration)"
+if not HAVE_LLM:
+    st.sidebar.checkbox(label + " — (Ollama/LLM not available)", value=False, key="use_creative", disabled=True)
+else:
+    st.sidebar.checkbox(label, value=False, key="use_creative")
+
+# Danger zone
+with st.sidebar.expander("⚠️ Danger zone", expanded=False):
+    st.caption("These actions permanently delete data.")
+    if st.button("Clear current session (chat + DB)"):
+        try:
+            for p in db.get_plot_paths(st.session_state.session_id):
+                Path(p).unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            db.clear_session(st.session_state.session_id)
+        except Exception:
+            pass
+        st.session_state.update(
+            messages=[],
+            df=None,
+            schema={},
+            defaults={"metric": None, "time_col": None},
+            session_id=str(uuid.uuid4()),
+            last_uploaded=None,
+        )
+        try:
+            db.ensure_session(st.session_state.session_id, title="Streamlit Session")
+        except Exception:
+            pass
+        st.success("Current session cleared.")
+        st.rerun()
+
+    confirm = st.checkbox("I understand this will delete ALL sessions", key="wipe_all_confirm")
+    if st.button("Wipe entire database") and confirm:
+        try:
+            for img in PLOTS_DIR.glob("*.png"):
+                img.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            db.wipe_all()
+        except Exception:
+            pass
+        st.session_state.update(
+            messages=[],
+            df=None,
+            schema={},
+            defaults={"metric": None, "time_col": None},
+            session_id=str(uuid.uuid4()),
+            last_uploaded=None,
+        )
+        try:
+            db.ensure_session(st.session_state.session_id, title="Streamlit Session")
+        except Exception:
+            pass
+        st.success("Entire database wiped.")
+        st.rerun()
+
+# Debug
+with st.sidebar.expander("🔍 Debug", expanded=False):
+    st.write("Router mode:", "Creative" if st.session_state.use_creative else "Rules")
+    st.json(st.session_state.get("last_router_status") or {"note": "no router calls yet"})
+
+# ------------------------------------------------------------------
+# Render existing chat, then input
+# ------------------------------------------------------------------
+creative_mode = st.sidebar.toggle("Creative Mode", value=False)
 prompt = st.chat_input("Ask a question…")
+from src.llm.router_graph import run_router_graph
 
 if prompt:
-    # record the user message
+    if creative_mode:
+        result, narrative, error = run_router_graph(prompt)
+        router_used = "creative"
+    else:
+        result, narrative, error = run_rule_based_router(prompt)
+        router_used = "rules"
+
+    # Show user message
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Show assistant message (result, narrative, or error)
+    with st.chat_message("assistant"):
+        if result:
+            kind = result.get("kind")
+            payload = result.get("payload")
+
+            if kind == "text":
+                st.markdown(payload)
+            elif kind == "table":
+                st.dataframe(payload, use_container_width=True)
+            elif kind == "image":
+                st.image(payload["path"])
+            elif kind == "table+image":
+                st.dataframe(payload["table"], use_container_width=True)
+                st.image(payload["path"])
+        if narrative:
+            st.info(narrative)
+        if error:
+            st.error(error)
+
+# ------------------------------------------------------------------
+# Intent handlers (Rules path and fallback use these)
+# ------------------------------------------------------------------
+def handle_intent(intent: str, args: Dict[str, Any]):
+    df = st.session_state.df
+    if df is None:
+        add_message("assistant", "❌ No dataset loaded.")
+        return
+
+    # Common agg normalization
+    def _norm_agg(a: str) -> str:
+        return {"avg": "mean", "average": "mean", "minimum": "min", "maximum": "max"}.get((a or "").lower(), (a or "").lower())
+
+    try:
+        if intent == "schema_probe":
+            add_message("assistant", "Columns:\n- " + "\n- ".join(df.columns))
+
+        elif intent == "qa_numeric":  # top k by sum(metric)
+            k = int(args.get("k", 5))
+            group = resolve_column(args.get("group"), df.columns) or args.get("group")
+            metric = resolve_column(args.get("metric"), df.columns) or args.get("metric")
+            table, err = analytics.top_k_by_group(k, group, metric)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag=f"TOP-{k} by {metric}")
+
+        elif intent == "agg":  # grouped
+            agg = _norm_agg(args.get("agg", "mean"))
+            group = resolve_column(args.get("group"), df.columns) or args.get("group")
+            metric = resolve_column(args.get("metric"), df.columns) or args.get("metric")
+            table, err = analytics.aggregate_by_group(group, metric, agg=agg)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag=f"{agg.upper()} of {metric} by {group}")
+
+        elif intent == "agg_overall":  # overall single number
+            agg = _norm_agg(args.get("agg", "mean"))
+            metric = resolve_column(args.get("metric"), df.columns) or args.get("metric") or ""
+            if not metric:
+                add_message("assistant", "❌ No column specified for aggregation.")
+                return
+            series = pd.to_numeric(df[metric], errors="coerce")
+            funcs = {
+                "mean": series.mean, "sum": series.sum, "count": series.count,
+                "min": series.min, "max": series.max, "median": series.median,
+            }
+            if agg not in funcs:
+                add_message("assistant", f"❌ Unsupported aggregation `{agg}`."); return
+            val = funcs[agg]()
+            add_table(pd.DataFrame({"metric": [metric], agg: [val]}), tag=f"{agg} of {metric}")
+
+        elif intent == "plot":
+            x = args.get("x") or st.session_state.defaults.get("time_col")
+            y = args.get("y") or st.session_state.defaults.get("metric")
+            hue = args.get("hue")
+            path, err = viz.plot_group_sum(x, y, hue=hue, fname_prefix="graph")
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_image(path, caption=path)
+
+        elif intent == "value_counts":
+            col = resolve_column(args.get("col"), df.columns) or args.get("col")
+            top = int(args.get("top", 20))
+            table, err = more.value_counts(col, top=top)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag=f"TOP-{top} {col}")
+
+        elif intent == "describe":
+            table, err = more.describe_numeric()
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag="DESCRIBE")
+
+        elif intent == "missing":
+            table, err = more.missing_report()
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag="MISSING REPORT")
+
+        elif intent == "corr":
+            table, path, err = more.correlation_matrix()
+            if err: add_message("assistant", f"❌ {err}")
+            else:
+                add_table(table, tag="CORRELATION")
+                add_image(path, caption=path)
+
+        elif intent == "hist":
+            col = resolve_column(args.get("col"), df.columns) or args.get("col")
+            bins = int(args.get("bins", 30))
+            _, err, path = more.histogram(col, bins=bins)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_image(path, caption=path)
+
+        elif intent == "box":
+            y = resolve_column(args.get("y"), df.columns) or args.get("y")
+            by = resolve_column(args.get("by"), df.columns) or args.get("by")
+            _, err, path = more.boxplot(y, by=by)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_image(path, caption=path)
+
+        elif intent == "pivot":
+            idx = resolve_column(args.get("index"), df.columns) or args.get("index")
+            cols = resolve_column(args.get("columns"), df.columns) or args.get("columns")
+            vals = resolve_column(args.get("values"), df.columns) or args.get("values")
+            agg = _norm_agg(args.get("agg", "sum"))
+            table, err = more.pivot_table(idx, cols, vals, agg=agg)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag=f"PIVOT {agg}")
+
+        elif intent == "rank_within":
+            group = resolve_column(args.get("group"), df.columns) or args.get("group")
+            order = resolve_column(args.get("order"), df.columns) or args.get("order")
+            table, err = win.rank_within(group, order)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag="RANK WITHIN")
+
+        elif intent == "cumsum":
+            group = resolve_column(args.get("group"), df.columns) or args.get("group")
+            metric = resolve_column(args.get("metric"), df.columns) or args.get("metric")
+            table, err = win.cumulative_sum(group, metric)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag="CUMSUM")
+
+        elif intent == "rolling_mean":
+            time_col = resolve_column(args.get("time_col"), df.columns) or args.get("time_col") or st.session_state.defaults.get("time_col")
+            metric = resolve_column(args.get("metric"), df.columns) or args.get("metric")
+            window = int(args.get("window", 3))
+            table, err = win.rolling_mean(time_col, metric, window=window)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag=f"ROLLING MEAN w={window}")
+
+        elif intent == "lag":
+            time_col = resolve_column(args.get("time_col"), df.columns) or args.get("time_col") or st.session_state.defaults.get("time_col")
+            metric = resolve_column(args.get("metric"), df.columns) or args.get("metric")
+            shift = int(args.get("shift", 1))
+            table, err = win.lag_lead(time_col, metric, shift=shift)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag=f"LAG {shift}")
+
+        elif intent == "outliers":
+            col = resolve_column(args.get("col"), df.columns) or args.get("col")
+            z = float(args.get("z", 3.0))
+            table, err = more.outliers_zscore(col, threshold=z)
+            if err: add_message("assistant", f"❌ {err}")
+            else: add_table(table, tag=f"OUTLIERS z>{z}")
+
+        else:  # help / unknown
+            add_message("assistant",
+                "I can help with schema, top-k, aggregates (overall or by group), plots, hist/box, "
+                "pivot, rolling/lag, and outliers.\n\nTry:\n"
+                "• `what columns do i have`\n"
+                "• `top 5 Vehicle_Type`\n"
+                "• `mean of Year`\n"
+                "• `average Range_km by Region`\n"
+                "• `plot average Range_km by Year, split by Region`"
+            )
+
+    except Exception as e:
+        add_message("assistant", f"❌ Error: {e}")
+
+# ------------------------------------------------------------------
+# Handle chat: Creative → fallback → Rules
+# ------------------------------------------------------------------
+if prompt:
     add_message("user", prompt)
 
-    if use_creative:
+    if st.session_state.use_creative and HAVE_LLM:
         result, narrative, err = run_router_graph(prompt)
-        if err:
-            add_message("assistant", f"❌ {err}")
+        st.session_state["last_router_status"] = {"input": prompt, "error": (str(err) if err else None), "has_result": bool(result)}
+        if err or not result:
+            add_message("assistant", "🤖 (Router had trouble — switching to safe mode.)")
+            intent, args = simple_router(prompt)
+            handle_intent(intent, args)
         else:
-            # render by kind
-            kind = result["kind"]
+            kind, payload = result["kind"], result["payload"]
             if kind == "text":
-                add_message("assistant", result["payload"])
+                add_message("assistant", payload)
             elif kind == "table":
-                add_table(result["payload"])
+                add_table(payload)
             elif kind == "table+image":
-                add_table(result["payload"]["table"])
-                add_image(result["payload"]["path"], caption=result["payload"]["path"])
+                add_table(payload["table"])
+                add_image(payload["path"], caption=payload["path"])
             elif kind == "image":
-                add_image(result["payload"]["path"], caption=result["payload"]["caption"])
-            # add the creative, short narrative
+                add_image(payload["path"], caption=payload.get("caption") or payload["path"])
             if narrative:
                 add_message("assistant", narrative)
     else:
-        # route to an intent (rules today; LLM later)
         intent, args = simple_router(prompt)
-
-        # ---- schema probe
-        if intent == "schema_probe":
-            add_message("assistant", list_columns())
-
-        # ---- top-k numeric
-        elif intent == "qa_numeric":
-            df_out, err = top_k_by_group(args.get("k", 5), args.get("group"), args.get("metric"))
-            if err:
-                add_message("assistant", f"❌ {err}")
-            else:
-                add_message("assistant", f"Here are the top {args.get('k', 5)} {args.get('group')} by {args.get('metric')}:")
-                add_table(
-                    df_out,
-                    caption="Tip: say ‘plot them by <time_col>’ or ‘plot marks by subject, split by name’.",
-                )
-
-        # ---- general aggregations (sum/average/count/min/max/median)
-        elif intent == "agg":
-            df_out, err = aggregate_by_group(args.get("group"), args.get("metric", ""), agg=args.get("agg", "sum"))
-            if err:
-                add_message("assistant", f"❌ {err}")
-            else:
-                pretty_agg = {"avg": "average"}.get(args.get("agg", "sum"), args.get("agg", "sum"))
-                title = (
-                    f"{pretty_agg.capitalize()} {args.get('metric')} by {args.get('group')}"
-                    if args.get("agg") != "count"
-                    else f"Count by {args.get('group')}"
-                )
-                add_message("assistant", title)
-                add_table(df_out, caption="Use ‘top 5 ... by ...’ for ranking, or ‘plot ... by ...’ to visualize.")
-    
-        elif intent == "agg_overall":
-            metric = args.get("metric", "")
-            agg = args.get("agg", "mean")
-            df = st.session_state.df
-            if df is None:
-                add_message("assistant", "❌ No dataset loaded.")
-            else:
-                col = metric
-                # If you added the fuzzy resolver, use it:
-                try:
-                    from src.tools.util import resolve_column
-                    col = resolve_column(col, df.columns) or col
-                except Exception:
-                    pass
-                if col not in df.columns:
-                    add_message("assistant", f"❌ Column `{metric}` not found.")
-                else:
-                    series = pd.to_numeric(df[col], errors="coerce")
-                    agg_norm = {"avg": "mean", "average": "mean"}.get(agg, agg)
-                    funcs = {
-                        "mean": series.mean,
-                        "sum": series.sum,
-                        "count": series.count,  # counts non-NaN
-                        "min": series.min,
-                        "max": series.max,
-                        "median": series.median,
-                    }
-                    func = funcs.get(agg_norm)
-                    if not func:
-                        add_message("assistant", f"❌ Unsupported aggregation `{agg}`.")
-                    else:
-                        val = func()
-                        add_message("assistant", f"{agg_norm.capitalize()} of `{col}` = **{val:.3f}**")
+        st.session_state["last_router_status"] = {"input": prompt, "router": "rules", "intent": intent, "args": args}
+        handle_intent(intent, args)
 
 
-        # ---- window-like funcs
-        elif intent == "rank_within":
-            df_out, err = rank_within(args["group"], args["order"])
-            add_message("assistant", f"Rank of {args['order']} within {args['group']}" if not err else f"❌ {err}")
-            if not err:
-                add_table(df_out)
 
-        elif intent == "cumsum":
-            df_out, err = cumulative_sum(args["group"], args["metric"])
-            add_message("assistant", f"Cumulative sum of {args['metric']} by {args['group']}" if not err else f"❌ {err}")
-            if not err:
-                add_table(df_out)
-
-        elif intent == "rolling_mean":
-            df_out, err = rolling_mean(args["time_col"], args["metric"], args.get("window", 3))
-            add_message("assistant", f"Rolling {args.get('window',3)}-period mean of {args['metric']}" if not err else f"❌ {err}")
-            if not err:
-                add_table(df_out)
-
-        elif intent == "lag":
-            df_out, err = lag_lead(args["time_col"], args["metric"], args.get("shift", 1))
-            add_message("assistant", f"Lagged {args['metric']} by {args.get('shift',1)}" if not err else f"❌ {err}")
-            if not err:
-                add_table(df_out)
-
-        # ---- extra analysis tools
-        elif intent == "describe":
-            df_out, err = describe_numeric()
-            add_message("assistant", "Summary statistics (numeric columns):" if not err else f"❌ {err}")
-            if not err:
-                add_table(df_out)
-
-        elif intent == "missing":
-            df_out, err = missing_report()
-            add_message("assistant", "Missing values report:" if not err else f"❌ {err}")
-            if not err:
-                add_table(df_out)
-
-        elif intent == "value_counts":
-            df_out, err = value_counts(args["col"], top=args.get("top", 20))
-            add_message("assistant", f"Value counts for `{args['col']}`:" if not err else f"❌ {err}")
-            if not err:
-                add_table(df_out)
-
-        elif intent == "corr":
-            df_out, path, err = correlation_matrix()
-            if err:
-                add_message("assistant", f"❌ {err}")
-            else:
-                add_message("assistant", "Correlation matrix (numeric columns):")
-                add_table(df_out, caption="Heatmap saved below.")
-                add_image(path, caption=path, spec={"type": "corr"})
-
-        elif intent == "hist":
-            df_out, err, path = histogram(args["col"], bins=args.get("bins", 30))
-            if err:
-                add_message("assistant", f"❌ {err}")
-            else:
-                add_message("assistant", f"Histogram of `{args['col']}`:")
-                add_image(path, caption=path, spec={"type": "hist", "col": args["col"], "bins": args.get("bins", 30)})
-
-        elif intent == "box":
-            df_out, err, path = boxplot(args["y"], by=args.get("by"))
-            if err:
-                add_message("assistant", f"❌ {err}")
-            else:
-                title = f"Boxplot of {args['y']}" + (f" by {args.get('by')}" if args.get("by") else "")
-                add_message("assistant", title)
-                add_image(path, caption=path, spec={"type": "box", "y": args["y"], "by": args.get("by")})
-
-        elif intent == "pivot":
-            df_out, err = pivot_table(args["index"], args["columns"], args["values"], agg=args.get("agg", "sum"))
-            add_message(
-                "assistant",
-                f"Pivot: {args['index']} × {args['columns']} → {args['values']} ({args.get('agg','sum')})"
-                if not err
-                else f"❌ {err}",
-            )
-            if not err:
-                add_table(df_out)
-
-        # ---- plotting (bar / grouped bar)
-        elif intent == "plot":
-            x = args.get("x")
-            y = args.get("y")
-            hue = args.get("hue")
-            if not y:
-                add_message("assistant", "I couldn't infer the metric to plot. Try: ‘plot revenue by month’.")
-            else:
-                path, err = plot_group_sum(x, y, hue=hue, fname_prefix="user")
-                if err:
-                    add_message("assistant", f"❌ {err}")
-                else:
-                    spec = {"x": x, "y": y, "hue": hue, "agg": "sum"}
-                    add_message("assistant", f"Saved chart to `{path}`.")
-                    add_image(path, caption=path, spec=spec)
-
-        # ---- default help
-        else:
-            default_metric = st.session_state.defaults.get("metric") or "<metric>"
-            default_time = st.session_state.defaults.get("time_col") or "<time_col>"
-            add_message(
-            "assistant",
-            (
-                "Try these:\n"
-                "- **Schema** → ‘what columns do i have?’\n"
-                f"- **Top-k** → ‘top 5 category by {default_metric}’\n"
-                f"- **Aggregate** → ‘average {default_metric} by category’, ‘count by subject’\n"
-                "- **Window** → ‘rank students by marks within subject’, ‘cumulative sum of revenue by month’\n"
-                "- **Explore** → ‘missing values report’, ‘value counts of subject’, ‘correlation matrix’\n"
-                f"- **Visualize** → ‘plot {default_metric} by {default_time}’, ‘histogram of {default_metric} bins 20’, ‘boxplot {default_metric} by category’\n"
-                "- **Pivot** → ‘pivot values revenue by region and month agg mean’\n"
-            ),
-            )
-
-    # Re-render history (single call → no duplicate keys)
-    render_messages()
+render_messages()

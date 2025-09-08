@@ -1,15 +1,16 @@
-# src/llm/router_graph.py
 from __future__ import annotations
-from typing import Optional, Literal, Dict, Any, Tuple
-from pydantic import BaseModel, Field, ValidationError
-from langgraph.graph import StateGraph, END
-from langchain_community.chat_models import ChatOllama
-import os
-from langchain_core.messages import SystemMessage, HumanMessage
+from typing import Optional, Literal, Dict, Any, Union, List
+import os, json
 import pandas as pd
 import streamlit as st
 
-# ---- import your existing tools
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from langgraph.graph import StateGraph, END
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_community.chat_models import ChatOllama
+
+# ---- tool imports
 from src.tools.analytics import list_columns, top_k_by_group, aggregate_by_group
 from src.tools.viz import plot_group_sum
 from src.tools.more_funcs import (
@@ -19,280 +20,295 @@ from src.tools.more_funcs import (
 from src.tools.windows_funcs import rank_within, cumulative_sum, rolling_mean, lag_lead
 from src.tools.util import resolve_column
 
-# --------- Pydantic schemas describing allowed tool calls ----------
+# ---------------- Models / Schemas ----------------
 class CallAgg(BaseModel):
-    tool: Literal["aggregate_by_group"] = "aggregate_by_group"
-    agg: Literal["sum","mean","average","avg","count","min","minimum","max","maximum","median"]
+    tool: Literal["aggregate_by_group"]
+    agg: str
     metric: Optional[str] = None
     group: Optional[str] = None
 
 class CallTopK(BaseModel):
-    tool: Literal["top_k_by_group"] = "top_k_by_group"
+    tool: Literal["top_k_by_group"]
     k: int = 5
     group: str
     metric: str
 
 class CallPlot(BaseModel):
-    tool: Literal["plot_group_sum"] = "plot_group_sum"
+    tool: Literal["plot_group_sum"]
     x: Optional[str] = None
     y: Optional[str] = None
     hue: Optional[str] = None
     agg: Optional[str] = "sum"
 
 class CallValueCounts(BaseModel):
-    tool: Literal["value_counts"] = "value_counts"
+    tool: Literal["value_counts"]
     col: str
     top: int = 20
 
 class CallSimple(BaseModel):
-    tool: Literal["list_columns","describe","missing","corr","hist","box","pivot","rank_within","cumsum","rolling_mean","lag","outliers","help"]
+    tool: Literal[
+        "list_columns","describe","missing","corr","hist","box","pivot",
+        "rank_within","cumsum","rolling_mean","lag","outliers","help"]
     args: Dict[str, Any] = Field(default_factory=dict)
 
-Intent = CallAgg | CallTopK | CallPlot | CallValueCounts | CallSimple
+Intent = Union[CallAgg, CallTopK, CallPlot, CallValueCounts, CallSimple]
+INTENT_ADAPTER = TypeAdapter(Intent)
 
-# --------- LangGraph state ---------
 class S(BaseModel):
     query: str
     intent: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
-    result: Optional[Dict[str, Any]] = None  # {"kind": "table|image|text", "payload": ...}
+    result: Optional[Dict[str, Any]] = None
     narrative: Optional[str] = None
 
-# --------- LLMs ---------
-MODEL = os.getenv("OLLAMA_MODEL", "llama3")  # change default if you pulled a different tag
-router_llm = ChatOllama(model=MODEL, temperature=0.2)
+# ---------------- Prompt setup ----------------
+def build_tool_system_prompt(cols: list[str]) -> str:
+    col_list = ", ".join(map(str, cols)) if len(cols) > 0 else "No dataset loaded yet"
+    return f"""
+You are Data Explorer's reasoning engine.
+
+You have access to the following tools, with their expected arguments shown in parentheses:
+
+- list_columns()
+- top_k_by_group(k, group, metric)
+- aggregate_by_group(group, metric, agg)
+- plot_group_sum(x, y, hue)
+- describe_numeric()
+- missing_report()
+- value_counts(col, top)
+- correlation_matrix()
+- histogram(col)
+- boxplot(col)
+- pivot_table(index, columns, values, aggfunc)
+- outliers_zscore(col)
+- rank_within(group, metric)
+- cumulative_sum(col)
+- rolling_mean(col, window)
+- lag_lead(col, n)
+
+Your job is to:
+1. Analyze the user's query.
+2. Select the most appropriate tool.
+3. Map the query to the correct arguments using the **current dataset columns** (which may include spelling variations).
+4. Return a **valid JSON object**.
+
+---
+
+You MUST return a JSON object with two fields:
+- `"tool"`: the name of the function to call (string)
+- `"args"`: dictionary of arguments
+
+❗ The output MUST be:
+- A single valid JSON object
+-do not miss the comma inbetween tools and args
+- Not wrapped in triple backticks (no ```json)
+- Not followed or preceded by **any** explanations or text
+- Free of markdown, natural language, or code formatting
+
+✅ Example valid output:
+{{ "tool": "list_columns", "args": {{}} }}
+
+---
+
+Current dataset columns:
+{col_list}
+""".strip()
+
+
+
+# ---------------- LLM setup ----------------
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableMap
+
+MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+
+system_prompt = build_tool_system_prompt(
+    st.session_state.get("df", pd.DataFrame()).columns
+)
+
+# Build prompt template
+router_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    ("user", "{input}")
+])
+
+# Compose final LLM + prompt chain
+router_llm = router_prompt | ChatOllama(model=MODEL, temperature=0.2)
+
+# Narrator LLM (can stay as-is)
 narrator_llm = ChatOllama(model=MODEL, temperature=0.7)
 
 
-SYSTEM_ROUTE = (
-    "You are a routing assistant. Return ONE JSON object only, no prose. "
-    "Choose one tool and arguments that best answer the user's request. "
-    "Use ONLY the provided column names. If unsure, use {\"tool\":\"help\",\"args\":{}}."
-)
+# ---------------- Helpers ----------------
+def repair_intent(data: dict, query: str) -> dict:
+    tool = data.get("tool")
+    q = query.lower()
 
-def _route_prompt(query: str, columns: list[str]) -> str:
-    return (
-        "Available tools:\n"
-        "1) list_columns\n"
-        "2) top_k_by_group {k:int, group:str, metric:str}\n"
-        "3) aggregate_by_group {agg:[sum,mean,average,avg,count,min,minimum,max,maximum,median], metric?:str, group?:str}\n"
-        "4) plot_group_sum {x?:str, y?:str, hue?:str, agg?:str}\n"
-        "5) value_counts {col:str, top?:int}\n"
-        "6) describe | missing | corr | hist | box | pivot | rank_within | cumsum | rolling_mean | lag | outliers | help\n\n"
-        f"Columns: {columns}\n\n"
-        f"User: {query}\n"
-        "Return ONLY JSON for ONE tool."
-    )
+    def norm(s):
+        return {
+            "avg": "mean", "average": "mean", "minimum": "min", "maximum": "max"
+        }.get(s.lower(), s.lower())
 
+    def infer_agg():
+        if any(x in q for x in ["avg", "average", "mean"]): return "mean"
+        if any(x in q for x in ["sum", "total"]): return "sum"
+        if any(x in q for x in ["min", "minimum"]): return "min"
+        if any(x in q for x in ["max", "maximum"]): return "max"
+        if "median" in q: return "median"
+        if "count" in q: return "count"
+        return "mean"
+
+    if tool == "aggregate_by_group":
+        data["agg"] = norm(data.get("agg") or infer_agg())
+    elif tool == "plot_group_sum":
+        data["agg"] = norm(data.get("agg") or infer_agg())
+    elif tool == "top_k_by_group" and not data.get("metric"):
+        return {"tool": "value_counts", "col": data.get("group"), "top": data.get("k", 5)}
+    elif tool == "value_counts" and not data.get("col"):
+        df = st.session_state.get("df")
+        if df is not None:
+            for c in df.columns:
+                if c.lower() in q:
+                    data["col"] = c; break
+    return data
+
+# ---------------- Nodes ----------------
 def node_route(state: S) -> S:
-    cols = list(st.session_state.df.columns) if st.session_state.df is not None else []
-    msgs = [
-        SystemMessage(SYSTEM_ROUTE),
-        HumanMessage(_route_prompt(state.query, cols)),
-    ]
-    try:
-        out = router_llm.invoke(msgs).content.strip()
-    except Exception as e:
-        # Graceful failure (don’t crash the app)
-        state.error = f"LLM router unavailable: {e}"
+    q = state.query.strip().lower()
+    if q in {"hi", "hello", "hey"}:
+        state.result = {"kind": "text", "payload": "👋 Hi! Upload a CSV and ask me about your data."}
         return state
 
-    # strip possible code fences
-    if out.startswith("```"):
-        out = out.strip("`").replace("json", "", 1).strip()
+    cols = list(st.session_state.get("df", pd.DataFrame()).columns)
+    msg = ChatPromptTemplate.from_messages([
+        ("system", build_tool_system_prompt(cols)),
+        ("user", "{input}")
+    ]).format_messages(input=state.query)
 
-    import json
     try:
+        print("📥 LLM Input Messages:")
+        for m in msg:
+            print(m)
+
+        response = router_llm.invoke(msg)
+
+        # Parse JSON output from LLM
+        out = response.content.strip()
+        print("🧠 Raw LLM output (before parse):", repr(out)) 
+
+        if out.startswith("```"):  # Remove Markdown wrappers if present
+            out = out.strip("`").replace("json", "").strip()
+
         data = json.loads(out)
-        intent = Intent.model_validate(data).model_dump()
-        state.intent = intent
+        intent = INTENT_ADAPTER.validate_python(repair_intent(data, state.query))
+        state.intent = intent.model_dump()
+    except ValidationError as ve:
+        state.error = f"❌ JSON validation failed: {ve}"
+    except json.JSONDecodeError as je:
+        state.error = f"❌ JSON parse error: {je}\nLLM output was:\n{out}"
     except Exception as e:
-        state.error = f"Router parse/validation failed: {e}"
+        state.error = f"❌ Router error: {e}\n\n🔍 LLM output:\n{out}"
     return state
 
-# normalize agg synonyms
-def _norm_agg(agg: str) -> str:
-    return {
-        "avg": "mean",
-        "average": "mean",
-        "minimum": "min",
-        "maximum": "max",
-    }.get(agg, agg)
 
-# Execute your existing tools; always apply resolve_column before using columns
 def node_execute(state: S) -> S:
-    if state.error or not state.intent:
-        return state
-    intent = state.intent
-    df = st.session_state.df
+    if state.error or not state.intent: return state
+    df = st.session_state.get("df")
     if df is None:
         state.error = "No dataset loaded."
         return state
 
-    tool = intent.get("tool")
-    args = intent.get("args", {}) if "args" in intent else {k:v for k,v in intent.items() if k != "tool"}
-    kind = "text"
-    payload = None
-
+    tool = state.intent["tool"]
+    args = state.intent.get("args", {})
     try:
         if tool == "list_columns":
-            payload = list_columns()
-            state.result = {"kind":"text","payload":payload}
-
+            state.result = {"kind": "text", "payload": list_columns()}
         elif tool == "top_k_by_group":
-            g = resolve_column(args["group"], df.columns)
-            m = resolve_column(args["metric"], df.columns)
-            table, err = top_k_by_group(args.get("k",5), g or args["group"], m or args["metric"])
+            g, m = resolve_column(args["group"], df.columns), resolve_column(args["metric"], df.columns)
+            table, err = top_k_by_group(args["k"], g, m)
             if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
+            state.result = {"kind": "table", "payload": table}
         elif tool == "aggregate_by_group":
-            agg = _norm_agg(args.get("agg","mean"))
-            group = args.get("group")
-            metric = args.get("metric","")
-            if group:
-                g = resolve_column(group, df.columns) or group
-                table, err = aggregate_by_group(g, metric, agg=agg)
+            g, m = args.get("group"), args.get("metric")
+            agg = args.get("agg", "mean")
+            if g:
+                g = resolve_column(g, df.columns)
+                table, err = aggregate_by_group(g, m, agg=agg)
                 if err: raise ValueError(err)
-                state.result = {"kind":"table","payload":table}
+                state.result = {"kind": "table", "payload": table}
             else:
-                # overall aggregation
-                col = resolve_column(metric, df.columns) or metric
-                if col not in df.columns: raise ValueError(f"Column `{metric}` not found.")
-                series = pd.to_numeric(df[col], errors="coerce")
+                series = pd.to_numeric(df[m], errors="coerce")
                 funcs = {
                     "mean": series.mean, "sum": series.sum, "count": series.count,
                     "min": series.min, "max": series.max, "median": series.median
                 }
-                val = funcs[agg]() if agg in funcs else None
-                if val is None: raise ValueError(f"Unsupported agg `{agg}`.")
-                t = pd.DataFrame({"metric":[col], agg:[val]})
-                state.result = {"kind":"table","payload":t}
-
+                if agg not in funcs: raise ValueError("Unsupported agg")
+                state.result = {"kind": "table", "payload": pd.DataFrame({"metric":[m], agg:[funcs[agg]()]})}
         elif tool == "plot_group_sum":
-            x = args.get("x")
-            y = args.get("y")
-            hue = args.get("hue")
-            path, err = plot_group_sum(x, y, hue=hue, fname_prefix="graph")
+            path, err = plot_group_sum(args.get("x"), args.get("y"), hue=args.get("hue"))
             if err: raise ValueError(err)
-            state.result = {"kind":"image","payload":{"path": path, "caption": path}}
-
+            state.result = {"kind": "image", "payload": {"path": path}}
         elif tool == "value_counts":
-            c = args["col"]
-            table, err = value_counts(c, top=args.get("top",20))
+            table, err = value_counts(args["col"], top=args.get("top",20))
             if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
+            state.result = {"kind": "table", "payload": table}
         elif tool == "describe":
-            table, err = describe_numeric()
-            if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
+            table, err = describe_numeric(); state.result = {"kind": "table", "payload": table} if not err else (_:=ValueError(err))
         elif tool == "missing":
-            table, err = missing_report()
-            if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
+            table, err = missing_report(); state.result = {"kind": "table", "payload": table} if not err else (_:=ValueError(err))
         elif tool == "corr":
             table, path, err = correlation_matrix()
-            if err: raise ValueError(err)
-            state.result = {"kind":"table+image","payload":{"table":table, "path":path}}
-
-        elif tool == "hist":
-            col = args.get("col") or args.get("column")
-            bins = int(args.get("bins",30))
-            _, err, path = histogram(col, bins=bins)
-            if err: raise ValueError(err)
-            state.result = {"kind":"image","payload":{"path":path, "caption":path}}
-
-        elif tool == "box":
-            y = args.get("y"); by = args.get("by")
-            _, err, path = boxplot(y, by=by)
-            if err: raise ValueError(err)
-            state.result = {"kind":"image","payload":{"path":path, "caption":path}}
-
-        elif tool == "pivot":
-            table, err = pivot_table(args["index"], args["columns"], args["values"], agg=args.get("agg","sum"))
-            if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
-        elif tool == "rank_within":
-            table, err = rank_within(args["group"], args["order"])
-            if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
-        elif tool == "cumsum":
-            table, err = cumulative_sum(args["group"], args["metric"])
-            if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
-        elif tool == "rolling_mean":
-            table, err = rolling_mean(args["time_col"], args["metric"], window=int(args.get("window",3)))
-            if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
-        elif tool == "lag":
-            table, err = lag_lead(args["time_col"], args["metric"], shift=int(args.get("shift",1)))
-            if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
-        elif tool == "outliers":
-            table, err = outliers_zscore(args["col"], threshold=float(args.get("z",3.0)))
-            if err: raise ValueError(err)
-            state.result = {"kind":"table","payload":table}
-
+            state.result = {"kind": "table+image", "payload": {"table": table, "path": path}} if not err else (_:=ValueError(err))
         elif tool == "help":
-            state.result = {"kind":"text","payload":"I can help with schema, top-k, aggregates, plots, hist/box, pivot, rolling/lag, outliers. Try: “top 5 Vehicle_Type”, “mean of Range_km”, “plot Range_km by Year, split by Region”."}
-
+            state.result = {"kind": "text", "payload": "Try: 'top 5 X', 'avg of Y by Z', 'plot A vs B'"}
         else:
             state.error = f"Unknown tool: {tool}"
-
     except Exception as e:
         state.error = f"Execution error: {e}"
-
     return state
 
 def node_narrate(state: S) -> S:
-    if not state.result or state.error:
-        return state
-    # short, creative but faithful summary
-    brief = "Return a short 1-2 sentence summary of these results without inventing columns."
-    desc = ""
-    kind = state.result["kind"]
-    if kind.startswith("table"):
-        df = state.result["payload"] if kind=="table" else state.result["payload"]["table"]
-        try:
-            head = df.head(5).to_markdown(index=False)
-        except Exception:
-            head = str(df.head(5))
-        desc = f"Table preview:\n{head}"
-    elif kind == "image":
-        desc = "A chart image was generated."
-    else:
-        desc = str(state.result.get("payload",""))
-
-    msgs = [
-        SystemMessage("You are a helpful data analyst."),
-        HumanMessage(f"{brief}\n\n{desc}")
-    ]
-    state.narrative = narrator_llm.invoke(msgs).content.strip()
+    if not state.result or state.error: return state
+    desc = "" if state.result["kind"] != "table" else str(state.result["payload"].head())
+    try:
+        out = narrator_llm.invoke([
+            SystemMessage("You are a helpful analyst."),
+            HumanMessage("Summarize in 1 sentence:\n" + desc)
+        ])
+        state.narrative = out.content.strip()
+    except Exception:
+        state.narrative = None
     return state
 
-# --------- Build the graph ---------
+
+
+
+from typing import Tuple
+
+# ---------------- Graph ----------------
 graph = StateGraph(S)
 graph.add_node("route", node_route)
 graph.add_node("execute", node_execute)
 graph.add_node("narrate", node_narrate)
-
 graph.set_entry_point("route")
-graph.add_edge("route","execute")
-graph.add_edge("execute","narrate")
+graph.add_edge("route", "execute")
+graph.add_edge("execute", "narrate")
 graph.add_edge("narrate", END)
 
-app = graph.compile()
+runnable_graph = graph.compile()
 
-def run_router_graph(user_query: str) -> Tuple[Optional[Dict[str,Any]], Optional[str], Optional[str]]:
-    """Returns (result, narrative, error)."""
-    state = S(query=user_query)
-    out = app.invoke(state)
-    return out.result, out.narrative, out.error
+# -------- Exported function --------
+def run_router_graph(user_input: str) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+    try:
+        print("📥 Input to router graph:", user_input)
+        state = S(query=user_input)
+        output_data = runnable_graph.invoke(state)
+        output = S(**output_data) 
+        print("✅ Output from graph:", output)
+        print("📦 Result:", output.result)
+        print("📝 Narrative:", output.narrative)
+        print("❗ Error:", output.error)
+        return output.result, output.narrative, output.error
+    except Exception as e:
+        print("❌ Graph exception:", e)
+        return None, None, str(e)
