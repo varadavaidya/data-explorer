@@ -51,7 +51,16 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Run the app 
+### 4. Run OLLAMA's llama3
+
+```bash
+ollama list # if empty do below, else ignore
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &
+ollama run llama3
+```
+
+### 5. Run the app 
 
 ```bash
 streamlit run streamlit_app.py
