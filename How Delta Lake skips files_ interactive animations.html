@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>How Delta Lake skips files</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f2f5f8;--ink:#14202b;--mute:#566878;--line:#cbd5de;--surf:#fff;--hit:#f2b705;--f0:#1b998b;--f1:#3a6ea5;--f2:#7b5ea7;--f3:#c44569;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0f1720;--ink:#e8eef4;--mute:#9aabba;--line:#2b3946;--surf:#16212c;color-scheme:dark}}
+:root[data-theme=dark]{--bg:#0f1720;--ink:#e8eef4;--mute:#9aabba;--line:#2b3946;--surf:#16212c;color-scheme:dark}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 'IBM Plex Sans',system-ui,sans-serif}
+main{max-width:720px;margin:0 auto;padding:28px 18px 56px}
+h1{font-size:1.7rem;line-height:1.2;margin:0 0 6px}
+h2{font-size:1.15rem;margin:36px 0 4px;padding-top:20px;border-top:1px solid var(--line)}
+p{margin:6px 0 14px;max-width:62ch}.mute{color:var(--mute);font-size:.92rem}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+button{font:inherit;padding:7px 14px;border:1px solid var(--line);background:var(--surf);color:var(--ink);border-radius:8px;cursor:pointer}
+button[aria-pressed=true]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+button:focus-visible,input:focus-visible{outline:3px solid var(--hit);outline-offset:2px}
+.row{display:grid;grid-template-columns:34px 1fr 56px;gap:10px;align-items:center;margin:8px 0}
+.track{position:relative;height:22px;background:var(--surf);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg{position:absolute;top:0;bottom:0;background:var(--f1);opacity:.85;transition:left .7s ease,width .7s ease}
+.mk{position:absolute;top:0;bottom:0;width:2px;background:var(--hit);box-shadow:0 0 0 1px #0006}
+.badge{font-weight:600;font-size:.85rem;text-align:right;color:var(--mute)}
+.row.hit .badge{color:var(--hit)}.row.hit .track{border-color:var(--hit)}.row:not(.hit) .track{opacity:.5}
+input[type=range]{width:100%;accent-color:var(--hit)}
+.count{font-weight:600;margin:10px 0}
+.stage{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start}
+.grid{position:relative;display:grid;grid-template-columns:repeat(4,64px);grid-auto-rows:64px;gap:3px}
+.cell{display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;border-radius:6px;opacity:.9;transition:transform .2s}
+.cell.f0{background:var(--f0)}.cell.f1{background:var(--f1)}.cell.f2{background:var(--f2)}.cell.f3{background:var(--f3)}
+.cell.q{outline:3px solid var(--hit);outline-offset:-3px}.cell.now{transform:scale(1.12);outline:3px solid #fff}
+svg.path{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+svg.path polyline{fill:none;stroke:var(--ink);stroke-width:.06;stroke-linejoin:round;stroke-linecap:round}
+.res{min-width:230px}.res h3{font-size:.98rem;margin:0 0 4px}
+.chips{display:flex;gap:6px;margin:4px 0 12px}
+.chip{padding:4px 10px;border-radius:6px;border:1px solid var(--line);font-size:.85rem;background:var(--surf);color:var(--mute)}
+.chip.hit{border-color:var(--hit);color:var(--ink);font-weight:600;box-shadow:inset 0 0 0 1px var(--hit)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body><main>
+<h1>How Delta Lake skips files</h1>
+<p class="mute">Delta keeps a min and max per column for every file. A query reads only the files whose range could contain the value it wants.</p>
+
+<h2>1. Overlapping ranges vs clustered ranges</h2>
+<p>Each bar is one file’s customer_id range (1 to 10,000). Move the slider to change the customer you look up.</p>
+<div class="bar" role="group" aria-label="Layout">
+<button id="bun" aria-pressed="true">Unclustered</button><button id="bcl" aria-pressed="false">Clustered</button></div>
+<div id="files"></div>
+<label class="mute" for="qs">Looking up customer_id = <b id="qv">4200</b></label>
+<input id="qs" type="range" min="1" max="10000" value="4200">
+<div class="count" id="cnt"></div>
+
+<h2>2. The Z-curve: how two columns share one file layout</h2>
+<p>Each cell shows its Z-value (the bits of x and y interleaved). Sorting by Z-value and cutting every four cells gives four files, shown by color.</p>
+<div class="bar"><button id="play">Play the curve</button>
+<button class="qb" data-q="none" aria-pressed="true">No query</button>
+<button class="qb" data-q="x1" aria-pressed="false">Query x = 1</button>
+<button class="qb" data-q="y3" aria-pressed="false">Query y = 3</button></div>
+<div class="stage"><div class="grid" id="grid" role="img" aria-label="4 by 4 grid of Z-values"></div>
+<div class="res"><h3>Z-order layout</h3><div class="chips" id="zc"></div><div class="mute" id="zt"></div>
+<h3 style="margin-top:14px">Sort by x, then y</h3><div class="chips" id="sc"></div><div class="mute" id="st"></div></div></div>
+<p class="mute" style="margin-top:18px">Sorting wins on the first column and loses on the second. Z-order gives both columns a fair result. Simplified: real Delta maps values to ranks before interleaving.</p>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const FILES={un:[[1,9800],[3,9950],[2,9900],[5,9990]],cl:[[1,2500],[2501,5000],[5001,7500],[7501,10000]]};
+let mode='un',q=4200;const rows=[];
+FILES.un.forEach((_,i)=>{const r=document.createElement('div');r.className='row';
+r.innerHTML='<span>f'+(i+1)+'</span><div class="track"><div class="seg"></div><div class="mk"></div></div><span class="badge"></span>';
+$('#files').appendChild(r);rows.push(r)});
+function rf(){let n=0;rows.forEach((r,i)=>{const[a,b]=FILES[mode][i],h=a<=q&&q<=b;n+=h;
+const s=r.querySelector('.seg');s.style.left=a/100+'%';s.style.width=(b-a)/100+'%';
+r.querySelector('.mk').style.left=q/100+'%';r.classList.toggle('hit',h);r.querySelector('.badge').textContent=h?'READ':'SKIP'});
+$('#cnt').textContent='Files read: '+n+' of 4';$('#qv').textContent=q.toLocaleString('en-US')}
+$('#bun').onclick=()=>{mode='un';$('#bun').setAttribute('aria-pressed',true);$('#bcl').setAttribute('aria-pressed',false);rf()};
+$('#bcl').onclick=()=>{mode='cl';$('#bcl').setAttribute('aria-pressed',true);$('#bun').setAttribute('aria-pressed',false);rf()};
+$('#qs').oninput=e=>{q=+e.target.value;rf()};rf();
+const z=(x,y)=>((x>>1)&1)<<3|((y>>1)&1)<<2|(x&1)<<1|(y&1);
+const cells=[];const g=$('#grid');
+for(let y=0;y<4;y++)for(let x=0;x<4;x++){const c=document.createElement('div'),v=z(x,y);
+c.className='cell f'+(v>>2);c.textContent=v;g.appendChild(c);cells.push({c,x,y,v})}
+const order=[...cells].sort((a,b)=>a.v-b.v);
+const NS='http://www.w3.org/2000/svg',sv=document.createElementNS(NS,'svg');
+sv.setAttribute('viewBox','0 0 4 4');sv.setAttribute('class','path');
+const pl=document.createElementNS(NS,'polyline');sv.appendChild(pl);g.appendChild(sv);
+function chips(el,set){el.innerHTML='';'ABCD'.split('').forEach((l,i)=>{const s=document.createElement('span');
+s.className='chip'+(set.has(i)?' hit':'');s.textContent=l+(set.has(i)?' READ':' SKIP');el.appendChild(s)})}
+let qk='none';
+function rq(){const m=cells.filter(o=>qk==='x1'?o.x===1:qk==='y3'?o.y===3:false);
+cells.forEach(o=>o.c.classList.toggle('q',m.includes(o)));
+const zs=new Set(m.map(o=>o.v>>2)),ss=new Set(m.map(o=>o.x));
+chips($('#zc'),zs);chips($('#sc'),ss);
+$('#zt').textContent=qk==='none'?'Pick a query above.':'Reads '+zs.size+' of 4 files';
+$('#st').textContent=qk==='none'?'':'Reads '+ss.size+' of 4 files'}
+document.querySelectorAll('.qb').forEach(b=>b.onclick=()=>{qk=b.dataset.q;
+document.querySelectorAll('.qb').forEach(o=>o.setAttribute('aria-pressed',o===b));rq()});rq();
+let timer;
+$('#play').onclick=()=>{clearInterval(timer);cells.forEach(o=>o.c.classList.remove('now'));pl.setAttribute('points','');
+const pts=o=>(o.x+.5)+','+(o.y+.5);
+if(matchMedia('(prefers-reduced-motion:reduce)').matches){pl.setAttribute('points',order.map(pts).join(' '));return}
+let k=0;timer=setInterval(()=>{if(k>=16){clearInterval(timer);cells.forEach(o=>o.c.classList.remove('now'));return}
+cells.forEach(o=>o.c.classList.remove('now'));order[k].c.classList.add('now');
+pl.setAttribute('points',order.slice(0,k+1).map(pts).join(' '));k++},330)};
+</script></body></html>
